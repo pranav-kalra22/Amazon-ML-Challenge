@@ -14,7 +14,9 @@ venv/
 data/
 models/
 checkpoints/
+6ab10eb3b23ba_student_resource/
 
 # Operating system files
 Thumbs.db
 .DS_Store
+__MACOSX/
