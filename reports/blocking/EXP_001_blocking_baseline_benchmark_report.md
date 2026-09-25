@@ -39,6 +39,8 @@
 
 ## 4. Diagnostic Candidate Caps Benchmark
 
+> **NOTE:** The candidate cap figures below were evaluated using arbitrary set-iteration truncation (`list(set(candidates))[:K]`) without candidate evidence ranking. They are **UNRANKED / NOT VALID FOR TOP-K DECISIONS** and are preserved strictly for historical baseline auditability. Ranked Top-K evaluation is introduced in EXP_002.
+
 | Candidate Cap | Link Recall | Full Entity Coverage | Oracle Macro $F_{0.5}$ |
 | :--- | :--- | :--- | :--- |
 | `Uncapped` | 83.390% | 62.030% | **0.925756** |
@@ -46,6 +48,7 @@
 | `100` | 59.221% | 36.182% | **0.730959** |
 | `50` | 48.186% | 27.514% | **0.629972** |
 | `30` | 40.579% | 22.333% | **0.550970** |
+
 
 ## 5. Miss Analysis Breakdown
 
