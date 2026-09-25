@@ -1,0 +1,27 @@
+{
+  "timestamp": "2026-09-25T13:31:56Z",
+  "audit_level": "FULL-DATA MEASUREMENT",
+  "total_labelled_links_checked": 7638365,
+  "same_country_links": 7638365,
+  "cross_country_links": 0,
+  "missing_lookup_ids": 0,
+  "same_country_ratio": 1.0,
+  "counts_by_source": {
+    "S2": {
+      "same": 3693619,
+      "cross": 0,
+      "missing": 0
+    },
+    "S3": {
+      "same": 3944746,
+      "cross": 0,
+      "missing": 0
+    }
+  },
+  "counts_by_country_pair": {
+    "US -> US": 4578522,
+    "India -> India": 3059843
+  },
+  "cross_country_examples": [],
+  "country_partitioning_policy": "STRICT_HARD_BLOCK"
+}

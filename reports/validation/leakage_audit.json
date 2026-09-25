@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-09-25T13:29:48Z",
+  "total_unique_matched_s2_ids": 3693619,
+  "total_unique_matched_s3_ids": 3944746,
+  "total_unique_matched_candidates": 7638365,
+  "candidates_mapped_to_multiple_s1": 0,
+  "max_s1_mappings_for_any_candidate": 1,
+  "cross_split_leakage_candidate_count": 0,
+  "leakage_verdict": "ZERO_LEAKAGE",
+  "representative_examples": []
+}

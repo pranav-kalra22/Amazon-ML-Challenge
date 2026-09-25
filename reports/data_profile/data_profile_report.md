@@ -1,8 +1,6 @@
 # Amazon ML Challenge 2026 — Comprehensive Data Profile Report
 
 **Generated:** 2026-09-25T12:00:02Z  
-**Total Profiling Runtime:** 189.08 seconds  
-
 ## 1. Population & File Sizes `[FULL-DATA MEASUREMENT]`
 
 | Split & Source | Row Count | File Size (MB) |
@@ -47,7 +45,7 @@
 
 ## 5. Core Architectural Takeaways
 
-1. **Zero Cross-Country Links**: Measured over 366,464 true links (`cross_country == 0`). Partitioning by exact country equality is 100% precision-safe.
-2. **France Exclusivity**: France appears ONLY in the test set (15.0% of test records: 259,452 S1, 703k S2, 731k S3). Zero training labels exist for France.
-3. **Singleton Guard Mandatory**: Exactly 123,247 singletons (5.58%). Every singleton false merge yields 0.0 under Macro F0.5.
-4. **Missing Addresses in S2/S3**: S1 has 0% missing addresses. S2 and S3 have ~3.4% missing addresses, requiring dual-path scoring (Name+Address vs Name-Only).
+1. **Zero Cross-Country Links `[FULL-DATA MEASUREMENT]`**: Measured across all 7,638,365 labelled training links (`cross_country == 0`, 100.0% same country). All labelled US and India training links satisfy exact country equality. The same generic equality rule (`country_A == country_B`) is applied dynamically to unseen country labels such as France; France ground truth is unavailable and therefore France recall cannot be directly verified.
+2. **France Exclusivity `[FULL-DATA MEASUREMENT]`**: France appears ONLY in the test set (15.0% of Test S1 records: 259,452 S1, 703,378 S2, 731,615 S3). Zero training labels exist for France.
+3. **Singleton Guard Mandatory `[FULL-DATA MEASUREMENT]`**: Exactly 123,247 singletons (5.58% of Source 1). Under entity-level Macro F0.5, correct empty predictions score 1.0, while any false positive link on a singleton collapses its entity score to 0.0.
+4. **Missing Addresses in S2/S3 `[FULL-DATA MEASUREMENT]`**: S1 has 0.00% missing addresses. Train S2 has 6.71% and Train S3 has 6.66% missing addresses (Test S2: 5.30%, Test S3: 5.36%), requiring dual-path candidate scoring (Name+Address vs Name-Only).

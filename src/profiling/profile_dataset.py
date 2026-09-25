@@ -124,12 +124,27 @@ def profile_all(dataset_root: str = "dataset", output_dir: str = "reports/data_p
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
         
-    # Write Markdown Profile Report
+    generate_markdown_report(summary, output_dir)
     report_path = os.path.join(output_dir, "data_profile_report.md")
+    print(f"\n[FULL-DATA MEASUREMENT] Complete! Saved to {report_path}", flush=True)
+
+
+def generate_markdown_report(summary: dict, output_dir: str):
+    """Generates the Markdown profile report, deriving all values dynamically from computed stats."""
+    report_path = os.path.join(output_dir, "data_profile_report.md")
+    audit_path = os.path.join(output_dir, "country_link_audit.json")
+    
+    country_audit = None
+    if os.path.exists(audit_path):
+        try:
+            with open(audit_path, "r", encoding="utf-8") as f:
+                country_audit = json.load(f)
+        except Exception:
+            country_audit = None
+
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("# Amazon ML Challenge 2026 — Comprehensive Data Profile Report\n\n")
-        f.write(f"**Generated:** {summary['timestamp']}  \n")
-        f.write(f"**Total Profiling Runtime:** {round(time.time() - start_time, 2)} seconds  \n\n")
+        f.write(f"**Generated:** {summary.get('timestamp', 'N/A')}  \n")
         
         f.write("## 1. Population & File Sizes `[FULL-DATA MEASUREMENT]`\n\n")
         f.write("| Split & Source | Row Count | File Size (MB) |\n")
@@ -161,13 +176,39 @@ def profile_all(dataset_root: str = "dataset", output_dir: str = "reports/data_p
             f.write(f"| `{k}` | {v['missing_name_rate']*100:.2f}% | {v['missing_address_rate']*100:.2f}% | {v['domain_name_rate']*100:.2f}% |\n")
             
         f.write("\n## 5. Core Architectural Takeaways\n\n")
-        f.write("1. **Zero Cross-Country Links**: Measured over 366,464 true links (`cross_country == 0`). Partitioning by exact country equality is 100% precision-safe.\n")
-        f.write("2. **France Exclusivity**: France appears ONLY in the test set (15.0% of test records: 259,452 S1, 703k S2, 731k S3). Zero training labels exist for France.\n")
-        f.write("3. **Singleton Guard Mandatory**: Exactly 123,247 singletons (5.58%). Every singleton false merge yields 0.0 under Macro F0.5.\n")
-        f.write("4. **Missing Addresses in S2/S3**: S1 has 0% missing addresses. S2 and S3 have ~3.4% missing addresses, requiring dual-path scoring (Name+Address vs Name-Only).\n")
-        
-    print(f"\n[FULL-DATA MEASUREMENT] Complete! Saved to {report_path}", flush=True)
+        if country_audit and country_audit.get("audit_level") == "FULL-DATA MEASUREMENT":
+            total_audited = country_audit.get("total_labelled_links_checked", card["total_true_links"])
+            cross_c = country_audit.get("cross_country_links", 0)
+            f.write(f"1. **Zero Cross-Country Links `[FULL-DATA MEASUREMENT]`**: Measured across all {total_audited:,} labelled training links (`cross_country == {cross_c}`, 100.0% same country). All labelled US and India training links satisfy exact country equality. The same generic equality rule (`country_A == country_B`) is applied dynamically to unseen country labels such as France; France ground truth is unavailable and therefore France recall cannot be directly verified.\n")
+        else:
+            f.write("1. **Zero Cross-Country Links `[SAMPLE MEASUREMENT]`**: Measured over a sample of links (`cross_country == 0`). Full population verification in progress.\n")
+
+        test_s1_fr = summary["country_distributions"]["test_s1"].get("France", 0)
+        test_s1_total = summary["file_statistics"]["test_s1"]["row_count"]
+        test_s2_fr = summary["country_distributions"]["test_s2"].get("France", 0)
+        test_s3_fr = summary["country_distributions"]["test_s3"].get("France", 0)
+        fr_pct = (test_s1_fr / test_s1_total) * 100 if test_s1_total > 0 else 0.0
+        f.write(f"2. **France Exclusivity `[FULL-DATA MEASUREMENT]`**: France appears ONLY in the test set ({fr_pct:.1f}% of Test S1 records: {test_s1_fr:,} S1, {test_s2_fr:,} S2, {test_s3_fr:,} S3). Zero training labels exist for France.\n")
+
+        s1_singles = card["singletons"]
+        s1_single_rate = card["singleton_rate"] * 100
+        f.write(f"3. **Singleton Guard Mandatory `[FULL-DATA MEASUREMENT]`**: Exactly {s1_singles:,} singletons ({s1_single_rate:.2f}% of Source 1). Under entity-level Macro F0.5, correct empty predictions score 1.0, while any false positive link on a singleton collapses its entity score to 0.0.\n")
+
+        tp = summary["text_patterns"]
+        s1_addr_miss = tp["train_s1"]["missing_address_rate"] * 100
+        s2_addr_miss = tp["train_s2"]["missing_address_rate"] * 100
+        s3_addr_miss = tp["train_s3"]["missing_address_rate"] * 100
+        f.write(f"4. **Missing Addresses in S2/S3 `[FULL-DATA MEASUREMENT]`**: S1 has {s1_addr_miss:.2f}% missing addresses. Train S2 has {s2_addr_miss:.2f}% and Train S3 has {s3_addr_miss:.2f}% missing addresses (Test S2: {tp['test_s2']['missing_address_rate']*100:.2f}%, Test S3: {tp['test_s3']['missing_address_rate']*100:.2f}%), requiring dual-path candidate scoring (Name+Address vs Name-Only).\n")
 
 
 if __name__ == "__main__":
-    profile_all()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--report-only":
+        summary_path = "reports/data_profile/dataset_summary.json"
+        with open(summary_path, "r") as f:
+            sum_data = json.load(f)
+        generate_markdown_report(sum_data, "reports/data_profile")
+        print("Updated reports/data_profile/data_profile_report.md successfully from computed statistics!")
+    else:
+        profile_all()
+
