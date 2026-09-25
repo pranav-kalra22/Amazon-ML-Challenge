@@ -6,7 +6,7 @@ This file is the single authoritative source of truth for the entire team regard
 
 ### Current Best Experiment: Initial Lower-Bound Baseline
 - **Experiment ID**: `EXP_000_all_singletons`
-- **Git Commit**: `0ff7096` (initial baseline)
+- **Git Commit**: `83bc810`
 - **Branch**: `main`
 - **Validation Macro F0.5**: `0.055840`
 - **Candidate Recall**: `0.0000`
