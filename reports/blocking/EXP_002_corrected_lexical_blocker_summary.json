@@ -1,0 +1,172 @@
+{
+  "experiment_id": "EXP_002_corrected_lexical_blocker",
+  "timestamp": "2026-09-25T16:14:31Z",
+  "validation_split": "val_50k_seed42",
+  "code_commit": "5af2d35",
+  "results_commit": "pending",
+  "git_dirty": false,
+  "config_file": "configs/blocking/blocking_v02.yaml",
+  "total_validation_s1_entities": 50000,
+  "total_validation_true_links": 172729,
+  "candidate_search_population": 10320219,
+  "primary_metrics": {
+    "true_link_recall": 0.575665,
+    "full_entity_coverage": 0.296962,
+    "oracle_macro_f05": 0.73605,
+    "oracle_macro_precision": 0.81958,
+    "oracle_macro_recall": 0.597637,
+    "total_candidate_pairs": 23228850,
+    "reduction_ratio": 0.99995498
+  },
+  "candidate_statistics": {
+    "mean": 464.577,
+    "median": 62.0,
+    "p90": 1500.0,
+    "p95": 1500.0,
+    "p99": 1500.0,
+    "max": 1500,
+    "min": 0
+  },
+  "subgroup_metrics": {
+    "country_breakdown": {
+      "US": {
+        "entity_count": 29990,
+        "macro_f05": 0.7504775631367603,
+        "macro_precision": 0.8301767255751917,
+        "macro_recall": 0.6153294087447138,
+        "singleton_accuracy": 1.0
+      },
+      "India": {
+        "entity_count": 20010,
+        "macro_f05": 0.7144263739092799,
+        "macro_precision": 0.8036981509245378,
+        "macro_recall": 0.5711207888119433,
+        "singleton_accuracy": 1.0
+      }
+    },
+    "source_diagnostics": {
+      "S2": {
+        "true_links": 83561,
+        "tp_links": 51492,
+        "link_recall": 0.61622
+      },
+      "S3": {
+        "true_links": 89168,
+        "tp_links": 47942,
+        "link_recall": 0.537659
+      }
+    },
+    "missing_address_diagnostics": {
+      "total_missing_addr_links_in_misses": 2942
+    }
+  },
+  "per_channel_metrics": [
+    {
+      "channel": "A",
+      "description": "Exact Normalized Name",
+      "link_recall": 0.39688182065547767,
+      "true_links_retrieved": 68553,
+      "unique_links_added": 68553,
+      "avg_candidates": 65.16982
+    },
+    {
+      "channel": "B",
+      "description": "Compact & Domain-Normalized",
+      "link_recall": 0.4197905389367159,
+      "true_links_retrieved": 72510,
+      "unique_links_added": 4676,
+      "avg_candidates": 65.77624
+    },
+    {
+      "channel": "C2",
+      "description": "Candidate-DF-Aware Rare Token",
+      "link_recall": 0.004376798337279785,
+      "true_links_retrieved": 756,
+      "unique_links_added": 230,
+      "avg_candidates": 0.02422
+    },
+    {
+      "channel": "D2",
+      "description": "True Address-Only Rescue",
+      "link_recall": 0.14039333290877617,
+      "true_links_retrieved": 24250,
+      "unique_links_added": 12772,
+      "avg_candidates": 2.77114
+    },
+    {
+      "channel": "E2",
+      "description": "Symmetric Transliteration",
+      "link_recall": 0.50055288920795,
+      "true_links_retrieved": 86460,
+      "unique_links_added": 13198,
+      "avg_candidates": 457.3082
+    },
+    {
+      "channel": "F",
+      "description": "Order-Invariant Token Pairs",
+      "link_recall": 0.00034157553161310493,
+      "true_links_retrieved": 59,
+      "unique_links_added": 5,
+      "avg_candidates": 0.00172
+    }
+  ],
+  "diagnostic_caps_ranked": [
+    {
+      "cap": "Uncapped",
+      "link_recall": 0.5756647696680928,
+      "full_entity_coverage": 0.29696237925775293,
+      "oracle_macro_f05": 0.7360498772079227
+    },
+    {
+      "cap": "500",
+      "link_recall": 0.5459187513388024,
+      "full_entity_coverage": 0.2726021013387561,
+      "oracle_macro_f05": 0.708836813045195
+    },
+    {
+      "cap": "250",
+      "link_recall": 0.5325509902795709,
+      "full_entity_coverage": 0.26124809354346723,
+      "oracle_macro_f05": 0.6958502700791497
+    },
+    {
+      "cap": "100",
+      "link_recall": 0.5075696611454938,
+      "full_entity_coverage": 0.23407049652601253,
+      "oracle_macro_f05": 0.6756576817132233
+    },
+    {
+      "cap": "50",
+      "link_recall": 0.47330789849996235,
+      "full_entity_coverage": 0.20903236739535672,
+      "oracle_macro_f05": 0.6433960772116862
+    },
+    {
+      "cap": "30",
+      "link_recall": 0.4507349663345472,
+      "full_entity_coverage": 0.19333587527537704,
+      "oracle_macro_f05": 0.6200018846345612
+    }
+  ],
+  "miss_analysis": {
+    "total_missed_links": 73295,
+    "miss_rate": 0.424335,
+    "category_breakdown": {
+      "address_shared_unindexed": 55682,
+      "complex_transliteration_variant": 14440,
+      "missing_address_candidate": 2942,
+      "name_token_overlap_unindexed": 211,
+      "severe_alias_or_dba": 20
+    },
+    "miss_file": "reports/blocking\\EXP_002_corrected_lexical_blocker_blocking_misses.csv"
+  },
+  "performance_profile": {
+    "index_runtime_sec": 125.5,
+    "retrieval_runtime_sec": 1000.53,
+    "evaluation_runtime_sec": 126.16,
+    "total_runtime_sec": 1283.01,
+    "initial_memory_mb": 84.35,
+    "peak_memory_mb": 4629.47,
+    "final_memory_mb": 4629.47
+  }
+}
