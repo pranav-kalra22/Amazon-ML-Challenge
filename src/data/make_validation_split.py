@@ -159,10 +159,73 @@ def verify_canonical_split(
     print(f"  Split File Validated:  {val_path}")
 
 
+def create_untouched_holdout(
+    dev_val_path: str = "artifacts/splits/val_s1_ids_50k_seed42.parquet",
+    dev_train_path: str = "artifacts/splits/train_s1_ids_seed42.parquet",
+    holdout_size: int = 50000,
+    seed: int = 2026,
+    output_dir: str = "artifacts/splits"
+):
+    print(f"Creating untouched holdout of {holdout_size:,} entities with seed {seed}...", flush=True)
+    dev_val_df = pd.read_parquet(dev_val_path)
+    train_pool_df = pd.read_parquet(dev_train_path)
+    
+    dev_val_ids = set(dev_val_df["entity_id"])
+    train_pool_ids = set(train_pool_df["entity_id"])
+    
+    assert len(dev_val_ids.intersection(train_pool_ids)) == 0, "Integrity Error: Overlap between dev val and train pool!"
+    
+    train_pool_df["strata"] = train_pool_df["country"].astype(str) + "_" + train_pool_df["is_singleton"].astype(str)
+    
+    holdout_frac = holdout_size / len(train_pool_df)
+    remaining_train_df, holdout_df = train_test_split(
+        train_pool_df,
+        test_size=holdout_frac,
+        random_state=seed,
+        stratify=train_pool_df["strata"]
+    )
+    
+    holdout_ids = set(holdout_df["entity_id"])
+    assert len(holdout_ids.intersection(dev_val_ids)) == 0, "Leakage Error: Holdout overlaps with dev validation set!"
+    assert len(holdout_df) == holdout_size, f"Size Error: Expected {holdout_size}, got {len(holdout_df)}"
+    
+    os.makedirs(output_dir, exist_ok=True)
+    holdout_path = os.path.join(output_dir, f"holdout_s1_ids_{holdout_size // 1000}k_seed{seed}.parquet")
+    holdout_df[["entity_id", "country", "is_singleton"]].to_parquet(holdout_path, index=False)
+    
+    metadata = {
+        "split_id": f"holdout_{holdout_size // 1000}k_seed{seed}",
+        "seed": seed,
+        "total_source1_entities": len(dev_val_df) + len(train_pool_df),
+        "holdout_size": len(holdout_df),
+        "dev_val_size": len(dev_val_df),
+        "remaining_train_pool_size": len(remaining_train_df),
+        "holdout_singletons": int(holdout_df["is_singleton"].sum()),
+        "holdout_singleton_rate": float(holdout_df["is_singleton"].mean()),
+        "holdout_country_distribution": holdout_df["country"].value_counts().to_dict(),
+        "dev_overlap_count": len(holdout_ids.intersection(dev_val_ids)),
+        "holdout_file": holdout_path
+    }
+    
+    meta_path = os.path.join(output_dir, f"holdout_metadata_seed{seed}.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+        
+    print(f"\n[VALIDATION MEASUREMENT] Created untouched holdout split:")
+    print(f"  Holdout entities:   {len(holdout_df):,} (Singletons: {metadata['holdout_singletons']:,}, {metadata['holdout_singleton_rate']*100:.2f}%)")
+    print(f"  Holdout countries:  {metadata['holdout_country_distribution']}")
+    print(f"  Overlap with dev:   {metadata['dev_overlap_count']}")
+    print(f"  Saved metadata to:  {meta_path}")
+    print(f"  Saved holdout to:   {holdout_path}")
+    return metadata
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--verify-only":
         verify_canonical_split()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--create-holdout":
+        create_untouched_holdout()
     else:
         create_validation_split()
 

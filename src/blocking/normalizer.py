@@ -121,7 +121,25 @@ def normalize_name_non_destructive(raw_name: Any) -> Dict[str, Any]:
     # 8. Distinctive tokens (len >= 3 and not in legal set)
     distinctive = [t for t in core_tokens if len(t) >= 3 and not t.isdigit()]
 
-    
+    # 9. Transliterated tokens & distinctive tokens
+    if is_asc:
+        trans_tokens = tokens
+        base_trans_dist = distinctive
+    else:
+        trans_tokens = [t for t in trans_cleaned.split() if len(t) >= 2]
+        base_trans_dist = [t for t in trans_core if len(t) >= 3 and not t.isdigit()]
+
+    # Repeat-collapsed transliterated tokens (e.g., "saaii" -> "sai") to bridge unidecode spelling variations
+    trans_dist_set = set(base_trans_dist)
+    for t in base_trans_dist:
+        collapsed = re.sub(r'(.)\1+', r'\1', t)
+        if len(collapsed) >= 3:
+            trans_dist_set.add(collapsed)
+    trans_distinctive = list(trans_dist_set)
+
+    # 10. Sorted token signature
+    sorted_sig = " ".join(sorted(distinctive)) if distinctive else ""
+
     return {
         "raw": raw_str,
         "norm_unicode": norm_u,
@@ -134,8 +152,21 @@ def normalize_name_non_destructive(raw_name: Any) -> Dict[str, Any]:
         "trans_stripped": trans_stripped,
         "trans_compact": trans_compact,
         "tokens": tokens,
-        "distinctive_tokens": distinctive
+        "distinctive_tokens": distinctive,
+        "trans_tokens": trans_tokens,
+        "trans_distinctive_tokens": trans_distinctive,
+        "sorted_token_signature": sorted_sig
     }
+
+
+COMMON_ADDR_STOP = {
+    "road", "street", "st", "rd", "ave", "avenue", "lane", "ln", "dr", "drive",
+    "blvd", "boulevard", "court", "ct", "place", "pl", "way", "circle", "cir",
+    "unit", "suite", "ste", "apt", "apartment", "fl", "floor", "bldg", "building",
+    "near", "opp", "opposite", "dist", "district", "post", "po", "box", "hwy", "highway",
+    "state", "city", "county", "sector", "plot", "flat", "gali", "colony", "nagar",
+    "west", "east", "north", "south", "central", "first", "second", "third"
+}
 
 
 def normalize_address_non_destructive(raw_addr: Any) -> Dict[str, Any]:
@@ -145,14 +176,18 @@ def normalize_address_non_destructive(raw_addr: Any) -> Dict[str, Any]:
     Retains:
     - raw: exact input Unicode string
     - norm_unicode: NFKC normalized, lowercased, trimmed
+    - compact_norm: alphanumeric characters only
     - tokens: all word/alphanumeric tokens
     - numeric_tokens: all numeric sequences (e.g., ["10018", "42"])
-    - building_raw: raw building identifier (e.g. "10018C", "42-B", "5/2")
-    - building_numeric: purely numeric digits of building (e.g. "10018" for "10018C") - BOTH RETAINED!
+    - building_raw: raw building identifier
+    - building_numeric: purely numeric digits of building
+    - all_building_numerics: set of candidate building numbers found anywhere in address
     - postal_code: detected 5-digit US ZIP or 6-digit India PIN
     - street_tokens: non-building, non-numeric street words
-    - road_standardized_tokens: tokens with abbreviations expanded (e.g. "st" -> "street")
+    - road_standardized_tokens: tokens with abbreviations expanded
+    - distinctive_tokens: non-stop, non-numeric locality/street tokens (len >= 4)
     - transliterated: ASCII transliteration
+    - trans_distinctive_tokens: transliterated locality/street tokens
     """
     if raw_addr is None or (isinstance(raw_addr, float) and str(raw_addr) == "nan"):
         raw_str = ""
@@ -163,14 +198,18 @@ def normalize_address_non_destructive(raw_addr: Any) -> Dict[str, Any]:
         return {
             "raw": raw_str,
             "norm_unicode": "",
+            "compact_norm": "",
             "tokens": [],
             "numeric_tokens": [],
             "building_raw": "",
             "building_numeric": "",
+            "all_building_numerics": [],
             "postal_code": "",
             "street_tokens": [],
             "road_standardized_tokens": [],
-            "transliterated": ""
+            "distinctive_tokens": [],
+            "transliterated": "",
+            "trans_distinctive_tokens": []
         }
         
     # 1. Unicode normalization & lower
@@ -182,6 +221,8 @@ def normalize_address_non_destructive(raw_addr: Any) -> Dict[str, Any]:
         norm_u = unicodedata.normalize("NFKC", raw_str).lower().strip()
         trans = text_unidecode.unidecode(norm_u).strip()
     
+    compact_norm = re.sub(r'[^a-z0-9]', '', norm_u)
+
     # 2. Extract Postal / PIN code directly from raw address
     postal = ""
     us_zip = re.search(r'\b(\d{5})(-\d{4})?\b', raw_str)
@@ -193,19 +234,24 @@ def normalize_address_non_destructive(raw_addr: Any) -> Dict[str, Any]:
         
     # 3. Tokenize
     tokens = re.findall(r'[a-z0-9]+', norm_u)
-    numeric_tokens = [t for t in tokens if t.isdigit()]
+    numeric_tokens = [t for t in tokens if t.isdigit() and len(t) <= 6]
     
-    # 4. Building number extraction: look at initial tokens containing digits
+    # 4. Building number extraction
     building_raw = ""
     building_numeric = ""
     for t in tokens[:4]:
         if any(c.isdigit() for c in t):
-            building_raw = t  # e.g., "10018c"
+            building_raw = t
             digits = re.sub(r'[^0-9]', '', t)
             if digits:
-                building_numeric = digits  # e.g., "10018"
+                building_numeric = digits
             break
             
+    # All building numerics: unique numeric tokens between 1 and 5 digits (excluding postal)
+    all_bldg_num = [t for t in numeric_tokens if 1 <= len(t) <= 5 and t != postal]
+    if building_numeric and building_numeric not in all_bldg_num:
+        all_bldg_num.insert(0, building_numeric)
+
     # 5. Street & road tokens
     street_tokens = []
     road_std_tokens = []
@@ -215,15 +261,36 @@ def normalize_address_non_destructive(raw_addr: Any) -> Dict[str, Any]:
             expanded = ROAD_MAPPINGS.get(t, t)
             road_std_tokens.append(expanded)
             
+    # 6. Distinctive address tokens (locality, distinctive street name)
+    distinctive_tokens = [
+        t for t in tokens
+        if len(t) >= 4 and not t.isdigit() and t not in COMMON_ADDR_STOP and t not in LEGAL_TERMS
+    ]
+
+    # 7. Transliterated distinctive address tokens
+    if is_asc:
+        trans_distinctive = distinctive_tokens
+    else:
+        trans_tokens = re.findall(r'[a-z0-9]+', trans)
+        trans_distinctive = [
+            t for t in trans_tokens
+            if len(t) >= 4 and not t.isdigit() and t not in COMMON_ADDR_STOP and t not in LEGAL_TERMS
+        ]
+
     return {
         "raw": raw_str,
         "norm_unicode": norm_u,
+        "compact_norm": compact_norm,
         "tokens": tokens,
         "numeric_tokens": numeric_tokens,
         "building_raw": building_raw,
         "building_numeric": building_numeric,
+        "all_building_numerics": all_bldg_num,
         "postal_code": postal,
         "street_tokens": street_tokens[:6],
         "road_standardized_tokens": road_std_tokens[:6],
-        "transliterated": trans
+        "distinctive_tokens": distinctive_tokens[:8],
+        "transliterated": trans,
+        "trans_distinctive_tokens": trans_distinctive[:8]
     }
+
