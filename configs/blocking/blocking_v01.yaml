@@ -1,0 +1,27 @@
+name: "multi_key_country_partition_v01"
+description: "Country-partitioned multi-key blocker utilizing brand token inverted index, domain unrolling, and address anchors."
+version: 1.0
+
+country_partitioning:
+  enabled: true
+  open_set: true
+
+keys:
+  brand_tokens:
+    enabled: true
+    min_token_len: 2
+    stop_words: ["inc", "llc", "corp", "ltd", "pvt", "limited", "company", "co", "sarl", "sasu", "eurl"]
+  domain_alias:
+    enabled: true
+    extensions: [".com", ".in", ".org", ".net", ".co", ".io", ".fr", ".biz"]
+  address_anchors:
+    enabled: true
+    use_building_numbers: true
+    normalize_leading_zeros: true
+    clean_alphanumeric_suffixes: true
+  transliteration:
+    enabled: true
+    engine: "text_unidecode"
+
+constraints:
+  max_candidates_per_entity: 30

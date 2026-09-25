@@ -1,0 +1,14 @@
+threshold_strategy: "macro_f05_singleton_guarded"
+
+parameters:
+  global_match_threshold: 0.75
+  singleton_guard_threshold: 0.80
+  source_specific:
+    s2_match_threshold: 0.75
+    s3_match_threshold: 0.75
+  relative_score_margin: 0.20
+
+optimization:
+  target_metric: "macro_f05"
+  grid_search_step: 0.02
+  validation_split: "val_50k_seed42"

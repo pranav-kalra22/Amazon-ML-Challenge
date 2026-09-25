@@ -1,0 +1,120 @@
+{
+  "timestamp": "2026-09-25T12:00:02Z",
+  "file_statistics": {
+    "train_s1": {
+      "path": "dataset\\train\\train_source1.tsv",
+      "size_bytes": 210069713,
+      "size_mb": 210.07,
+      "row_count": 2206821
+    },
+    "train_s2": {
+      "path": "dataset\\train\\train_source2.tsv",
+      "size_bytes": 489301488,
+      "size_mb": 489.3,
+      "row_count": 5034616
+    },
+    "train_s3": {
+      "path": "dataset\\train\\train_source3.tsv",
+      "size_bytes": 503705637,
+      "size_mb": 503.71,
+      "row_count": 5285603
+    },
+    "train_gt": {
+      "path": "dataset\\train\\train_ground_truth.tsv",
+      "size_bytes": 127015583,
+      "size_mb": 127.02,
+      "row_count": 2206821
+    },
+    "test_s1": {
+      "path": "dataset\\test\\test_source1.tsv",
+      "size_bytes": 175022086,
+      "size_mb": 175.02,
+      "row_count": 1732544
+    },
+    "test_s2": {
+      "path": "dataset\\test\\test_source2.tsv",
+      "size_bytes": 509456422,
+      "size_mb": 509.46,
+      "row_count": 4887273
+    },
+    "test_s3": {
+      "path": "dataset\\test\\test_source3.tsv",
+      "size_bytes": 506002772,
+      "size_mb": 506.0,
+      "row_count": 5082316
+    }
+  },
+  "country_distributions": {
+    "train_s1": {
+      "US": 1323633,
+      "India": 883188
+    },
+    "train_s2": {
+      "US": 3016817,
+      "India": 2017799
+    },
+    "train_s3": {
+      "US": 3170056,
+      "India": 2115547
+    },
+    "test_s1": {
+      "India": 809986,
+      "US": 663106,
+      "France": 259452
+    },
+    "test_s2": {
+      "India": 2312565,
+      "US": 1871330,
+      "France": 703378
+    },
+    "test_s3": {
+      "India": 2405000,
+      "US": 1945701,
+      "France": 731615
+    }
+  },
+  "cardinality": {
+    "total_source1_entities": 2206821,
+    "singletons": 123247,
+    "singleton_rate": 0.05585,
+    "mean_matches_per_non_singleton": 3.666,
+    "median_matches": 4,
+    "min_matches": 1,
+    "max_matches": 11,
+    "total_true_links": 7638365,
+    "s2_link_share_sample": 0.4828,
+    "s3_link_share_sample": 0.5172
+  },
+  "text_patterns": {
+    "train_s1": {
+      "missing_name_rate": 0.0,
+      "missing_address_rate": 0.0,
+      "domain_name_rate": 0.0
+    },
+    "train_s2": {
+      "missing_name_rate": 0.0,
+      "missing_address_rate": 0.06712,
+      "domain_name_rate": 0.03996
+    },
+    "train_s3": {
+      "missing_name_rate": 0.0,
+      "missing_address_rate": 0.06656,
+      "domain_name_rate": 0.03989
+    },
+    "test_s1": {
+      "missing_name_rate": 0.0,
+      "missing_address_rate": 0.0,
+      "domain_name_rate": 0.0
+    },
+    "test_s2": {
+      "missing_name_rate": 1e-05,
+      "missing_address_rate": 0.05296,
+      "domain_name_rate": 0.03192
+    },
+    "test_s3": {
+      "missing_name_rate": 1e-05,
+      "missing_address_rate": 0.05356,
+      "domain_name_rate": 0.03226
+    }
+  }
+}

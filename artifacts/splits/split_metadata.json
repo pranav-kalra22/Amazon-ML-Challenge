@@ -1,0 +1,19 @@
+{
+  "split_id": "val_50k_seed42",
+  "seed": 42,
+  "total_source1_entities": 2206821,
+  "val_size": 50000,
+  "train_size": 2156821,
+  "val_singletons": 2792,
+  "val_singleton_rate": 0.05584,
+  "val_country_distribution": {
+    "US": 29990,
+    "India": 20010
+  },
+  "train_country_distribution": {
+    "US": 1293643,
+    "India": 863178
+  },
+  "val_ids_file": "artifacts/splits\\val_s1_ids_50k_seed42.parquet",
+  "train_ids_file": "artifacts/splits\\train_s1_ids_seed42.parquet"
+}

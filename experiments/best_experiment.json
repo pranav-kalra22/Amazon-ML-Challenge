@@ -1,0 +1,8 @@
+{
+  "best_experiment_id": "EXP_000_all_singletons",
+  "validation_macro_f05": 0.05584,
+  "singleton_accuracy": 1.0,
+  "validation_split": "val_50k_seed42",
+  "timestamp": "2026-09-25T12:04:19Z",
+  "notes": "Initial lower-bound baseline (all singletons rule)."
+}

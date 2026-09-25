@@ -1,20 +1,36 @@
-# Local credentials
+# Local credentials & secrets
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
 # Python caches and environments
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
 .venv/
 venv/
-.ipynb_checkpoints/
+env/
 
-# Local datasets and trained models
-data/
-models/
-checkpoints/
-6ab10eb3b23ba_student_resource/
+# Root challenge datasets and junctions (must stay local)
+/data/
+/dataset
+/dataset/
+/6ab10eb3b23ba_student_resource/
+
+# Root large models, checkpoints, and caches
+/models/
+/checkpoints/
+/cache/
+/tmp/
+/temp/
+artifacts/cache/
+experiments/tmp/
+
+# Logs
+*.log
 
 # Operating system files
 Thumbs.db
