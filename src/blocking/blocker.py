@@ -181,7 +181,7 @@ class MultiChannelBlocker:
                     raw_addr = parts[col_addr]
 
                     # Tokenize name
-                    name_toks = set(re.findall(r'[a-z0-9]{4,}', raw_name.lower()))
+                    name_toks = set(re.findall(r'[a-z0-9]{3,}', raw_name.lower())) - LEGAL_TERMS
                     for tok in name_toks.intersection(tracked_name_tokens):
                         self.candidate_name_df[tok] += 1
 
@@ -269,7 +269,7 @@ class MultiChannelBlocker:
             if self.ch_C2_enabled:
                 c2_cand_tokens = [
                     t for t in n["distinctive_tokens"]
-                    if len(t) >= self.c2_min_len and self.candidate_name_df[t] <= self.c2_max_df
+                    if len(t) >= self.c2_min_len and t not in LEGAL_TERMS and self.candidate_name_df[t] <= self.c2_max_df
                 ]
                 if c2_cand_tokens:
                     c2_cand_tokens.sort(key=lambda t: (self.candidate_name_df[t], -len(t)))
@@ -280,37 +280,42 @@ class MultiChannelBlocker:
             # Channel D2: True Address-Only Rescue (Bit 8)
             if self.ch_D2_enabled and a["raw"]:
                 # 1. Exact normalized address (if substantial)
-                if self.d2_exact and len(a["norm_unicode"]) >= 10:
+                if self.d2_exact and len(a["norm_unicode"]) >= 12:
                     self.query_index[(CH_D2, c, f"exact_{a['norm_unicode']}")].append(s1_idx)
                     ch_counts[CH_D2] += 1
 
                 # 2. Compact normalized address
-                if self.d2_compact and len(a["compact_norm"]) >= 10:
+                if self.d2_compact and len(a["compact_norm"]) >= 15:
                     self.query_index[(CH_D2, c, f"compact_{a['compact_norm']}")].append(s1_idx)
                     ch_counts[CH_D2] += 1
 
-                # 3. Building numeric + street token
-                if self.d2_bldg_street:
-                    for bldg in a["all_building_numerics"][:2]:
-                        for st in a["street_tokens"][:2]:
-                            self.query_index[(CH_D2, c, f"bs_{bldg}_{st}")].append(s1_idx)
+                # 3. Building numeric + Postal code (highly discriminative physical location)
+                if a["building_numeric"] and a["postal_code"] and len(a["postal_code"]) in (5, 6):
+                    self.query_index[(CH_D2, c, f"bp_{a['building_numeric']}_{a['postal_code']}")].append(s1_idx)
+                    ch_counts[CH_D2] += 1
+
+                # 4. Building numeric + street token (ONLY if street token is selective)
+                if self.d2_bldg_street and a["building_numeric"]:
+                    for st in a["street_tokens"][:2]:
+                        if len(st) >= 4 and st not in COMMON_ADDR_STOP and self.candidate_addr_df[st] <= self.d2_addr_max_df:
+                            self.query_index[(CH_D2, c, f"bs_{a['building_numeric']}_{st}")].append(s1_idx)
                             ch_counts[CH_D2] += 1
 
-                # 4. Postal / PIN + street token
+                # 5. Postal / PIN + street token (ONLY if street token is selective)
                 if self.d2_postal_street and a["postal_code"]:
                     for st in a["street_tokens"][:2]:
-                        self.query_index[(CH_D2, c, f"ps_{a['postal_code']}_{st}")].append(s1_idx)
-                        ch_counts[CH_D2] += 1
+                        if len(st) >= 4 and st not in COMMON_ADDR_STOP and self.candidate_addr_df[st] <= self.d2_addr_max_df:
+                            self.query_index[(CH_D2, c, f"ps_{a['postal_code']}_{st}")].append(s1_idx)
+                            ch_counts[CH_D2] += 1
 
-                # 5. Distinctive address token pairs (sorted)
+                # 6. Distinctive address token pairs (sorted, both selective)
                 if self.d2_addr_pair:
                     valid_addr_toks = [
                         t for t in a["distinctive_tokens"]
-                        if len(t) >= self.d2_addr_min_len and self.candidate_addr_df[t] <= self.d2_addr_max_df
+                        if len(t) >= self.d2_addr_min_len and t not in COMMON_ADDR_STOP and self.candidate_addr_df[t] <= 15
                     ]
                     if len(valid_addr_toks) >= 2:
                         valid_addr_toks.sort(key=lambda t: self.candidate_addr_df[t])
-                        # Pair rarest token with up to 2 other distinctive tokens
                         t1 = valid_addr_toks[0]
                         for t2 in valid_addr_toks[1:3]:
                             pair_key = f"ap_{min(t1, t2)}_{max(t1, t2)}"
@@ -320,15 +325,15 @@ class MultiChannelBlocker:
             # Channel E2: Symmetric Cross-Script Transliteration (Bit 16)
             if self.ch_E2_enabled:
                 # Transliterated legal-stripped name (registers even if S1 is already ASCII!)
-                if n["trans_stripped"]:
+                if n["trans_stripped"] and n["trans_stripped"] not in LEGAL_TERMS:
                     self.query_index[(CH_E2, c, n["trans_stripped"])].append(s1_idx)
                     ch_counts[CH_E2] += 1
-                if len(n["trans_compact"]) >= 4:
+                if len(n["trans_compact"]) >= 6:
                     self.query_index[(CH_E2, c, n["trans_compact"])].append(s1_idx)
                     ch_counts[CH_E2] += 1
-                # Transliterated distinctive tokens
+                # Transliterated distinctive tokens (strictly selective)
                 for ttok in n["trans_distinctive_tokens"]:
-                    if len(ttok) >= self.e2_min_len and self.candidate_name_df[ttok] <= self.c2_max_df:
+                    if len(ttok) >= self.e2_min_len and ttok not in LEGAL_TERMS and self.candidate_name_df[ttok] <= self.c2_max_df:
                         self.query_index[(CH_E2, c, f"ttok_{ttok}")].append(s1_idx)
                         ch_counts[CH_E2] += 1
 
@@ -336,20 +341,21 @@ class MultiChannelBlocker:
             if self.ch_F_enabled:
                 dtoks = [
                     t for t in n["distinctive_tokens"]
-                    if len(t) >= 4 and self.candidate_name_df[t] <= self.f_max_df
+                    if len(t) >= 4 and t not in LEGAL_TERMS and self.candidate_name_df[t] <= self.f_max_df
                 ]
                 if len(dtoks) >= 2:
                     dtoks.sort(key=lambda t: self.candidate_name_df[t])
-                    # Take top rarest token and pair with other distinctive tokens
-                    t1 = dtoks[0]
-                    pairs_indexed = 0
-                    for t2 in dtoks[1:]:
-                        pair_str = f"pair_{min(t1, t2)}_{max(t1, t2)}"
-                        self.query_index[(CH_F, c, pair_str)].append(s1_idx)
-                        ch_counts[CH_F] += 1
-                        pairs_indexed += 1
-                        if pairs_indexed >= self.f_max_pairs:
-                            break
+                    # Require at least one token to have DF <= 10
+                    if self.candidate_name_df[dtoks[0]] <= 10:
+                        t1 = dtoks[0]
+                        pairs_indexed = 0
+                        for t2 in dtoks[1:]:
+                            pair_str = f"pair_{min(t1, t2)}_{max(t1, t2)}"
+                            self.query_index[(CH_F, c, pair_str)].append(s1_idx)
+                            ch_counts[CH_F] += 1
+                            pairs_indexed += 1
+                            if pairs_indexed >= self.f_max_pairs:
+                                break
 
         print(f"\n[QUERY INDEX BUILT] in {time.time()-t0:.2f}s across {len(self.query_index):,} total keys:", flush=True)
         for bit, ch_name in CHANNEL_NAMES.items():
@@ -358,18 +364,22 @@ class MultiChannelBlocker:
     def generate_candidates_streaming(
         self,
         candidate_file_paths: List[str],
-        progress_interval: int = 1000000
+        progress_interval: int = 1000000,
+        max_streaming_candidates_per_entity: int = 1500
     ) -> List[Dict[str, int]]:
         """
         Pass 2: Streams through candidate files and queries the inverted index.
-        Returns:
-            candidates: list of length len(s1_records), where candidates[s1_idx] is dict:
-                        cand_id -> bitmask (integer combining CH_A, CH_B, CH_C2, CH_D2, CH_E2, CH_F)
+        Applies a streaming safety cap (default 1,500 candidates per entity) to prevent runaway inflation.
         """
         n_s1 = len(self.idx_to_s1_id)
         candidates = [{} for _ in range(n_s1)]
         total_scanned = 0
         t_start = time.time()
+
+        def _add_candidate(s1_i: int, cid: str, bit: int):
+            c_dict = candidates[s1_i]
+            if len(c_dict) < max_streaming_candidates_per_entity or cid in c_dict:
+                c_dict[cid] = c_dict.get(cid, 0) | bit
 
         print(f"\n[PASS 2] Streaming candidates and querying multi-channel index...", flush=True)
 
@@ -403,53 +413,57 @@ class MultiChannelBlocker:
                     if self.ch_A_enabled:
                         if n["legal_stripped"]:
                             for s1_idx in self.query_index.get((CH_A, c, n["legal_stripped"]), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_A
+                                _add_candidate(s1_idx, cand_id, CH_A)
                         if n["punct_norm"] and n["punct_norm"] != n["legal_stripped"]:
                             for s1_idx in self.query_index.get((CH_A, c, n["punct_norm"]), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_A
+                                _add_candidate(s1_idx, cand_id, CH_A)
 
                     # Channel B: Compact & Domain (Bit 2)
                     if self.ch_B_enabled:
                         if len(n["compact_alnum"]) >= 4:
                             for s1_idx in self.query_index.get((CH_B, c, n["compact_alnum"]), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_B
+                                _add_candidate(s1_idx, cand_id, CH_B)
                         if len(n["legal_stripped_compact"]) >= 4 and n["legal_stripped_compact"] != n["compact_alnum"]:
                             for s1_idx in self.query_index.get((CH_B, c, n["legal_stripped_compact"]), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_B
+                                _add_candidate(s1_idx, cand_id, CH_B)
                         if n["domain_root"] and len(n["domain_root"]) >= 4:
                             for s1_idx in self.query_index.get((CH_B, c, n["domain_root"]), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_B
+                                _add_candidate(s1_idx, cand_id, CH_B)
 
                     # Channel C2: Candidate-DF Rare Token (Bit 4)
                     if self.ch_C2_enabled:
                         for tok in n["distinctive_tokens"]:
                             if len(tok) >= self.c2_min_len:
                                 for s1_idx in self.query_index.get((CH_C2, c, tok), []):
-                                    candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_C2
+                                    _add_candidate(s1_idx, cand_id, CH_C2)
 
                     # Channel D2: True Address-Only Rescue (Bit 8)
                     if self.ch_D2_enabled and raw_addr and raw_addr.lower() not in {"", "nan", "<null>", "null", "none"}:
                         a = normalize_address_non_destructive(raw_addr)
                         # Exact & compact
-                        if self.d2_exact and len(a["norm_unicode"]) >= 10:
+                        if self.d2_exact and len(a["norm_unicode"]) >= 12:
                             for s1_idx in self.query_index.get((CH_D2, c, f"exact_{a['norm_unicode']}"), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_D2
-                        if self.d2_compact and len(a["compact_norm"]) >= 10:
+                                _add_candidate(s1_idx, cand_id, CH_D2)
+                        if self.d2_compact and len(a["compact_norm"]) >= 15:
                             for s1_idx in self.query_index.get((CH_D2, c, f"compact_{a['compact_norm']}"), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_D2
+                                _add_candidate(s1_idx, cand_id, CH_D2)
+
+                        # Building + Postal
+                        if a["building_numeric"] and a["postal_code"]:
+                            for s1_idx in self.query_index.get((CH_D2, c, f"bp_{a['building_numeric']}_{a['postal_code']}"), []):
+                                _add_candidate(s1_idx, cand_id, CH_D2)
 
                         # Building + street
-                        if self.d2_bldg_street:
-                            for bldg in a["all_building_numerics"][:2]:
-                                for st in a["street_tokens"][:2]:
-                                    for s1_idx in self.query_index.get((CH_D2, c, f"bs_{bldg}_{st}"), []):
-                                        candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_D2
+                        if self.d2_bldg_street and a["building_numeric"]:
+                            for st in a["street_tokens"][:2]:
+                                for s1_idx in self.query_index.get((CH_D2, c, f"bs_{a['building_numeric']}_{st}"), []):
+                                    _add_candidate(s1_idx, cand_id, CH_D2)
 
                         # Postal + street
                         if self.d2_postal_street and a["postal_code"]:
                             for st in a["street_tokens"][:2]:
                                 for s1_idx in self.query_index.get((CH_D2, c, f"ps_{a['postal_code']}_{st}"), []):
-                                    candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_D2
+                                    _add_candidate(s1_idx, cand_id, CH_D2)
 
                         # Address token pairs
                         if self.d2_addr_pair and len(a["distinctive_tokens"]) >= 2:
@@ -458,20 +472,20 @@ class MultiChannelBlocker:
                                 for j in range(i + 1, len(dtoks_a)):
                                     pair_k = f"ap_{min(dtoks_a[i], dtoks_a[j])}_{max(dtoks_a[i], dtoks_a[j])}"
                                     for s1_idx in self.query_index.get((CH_D2, c, pair_k), []):
-                                        candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_D2
+                                        _add_candidate(s1_idx, cand_id, CH_D2)
 
                     # Channel E2: Symmetric Transliteration (Bit 16)
                     if self.ch_E2_enabled:
                         if n["trans_stripped"]:
                             for s1_idx in self.query_index.get((CH_E2, c, n["trans_stripped"]), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_E2
-                        if len(n["trans_compact"]) >= 4:
+                                _add_candidate(s1_idx, cand_id, CH_E2)
+                        if len(n["trans_compact"]) >= 6:
                             for s1_idx in self.query_index.get((CH_E2, c, n["trans_compact"]), []):
-                                candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_E2
+                                _add_candidate(s1_idx, cand_id, CH_E2)
                         for ttok in n["trans_distinctive_tokens"]:
                             if len(ttok) >= self.e2_min_len:
                                 for s1_idx in self.query_index.get((CH_E2, c, f"ttok_{ttok}"), []):
-                                    candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_E2
+                                    _add_candidate(s1_idx, cand_id, CH_E2)
 
                     # Channel F: Order-Invariant Name Token Pairs (Bit 32)
                     if self.ch_F_enabled and len(n["distinctive_tokens"]) >= 2:
@@ -480,7 +494,8 @@ class MultiChannelBlocker:
                             for j in range(i + 1, len(dtoks)):
                                 p_str = f"pair_{min(dtoks[i], dtoks[j])}_{max(dtoks[i], dtoks[j])}"
                                 for s1_idx in self.query_index.get((CH_F, c, p_str), []):
-                                    candidates[s1_idx][cand_id] = candidates[s1_idx].get(cand_id, 0) | CH_F
+                                    _add_candidate(s1_idx, cand_id, CH_F)
+
 
                     if rows_in_file % progress_interval == 0:
                         now = time.time()

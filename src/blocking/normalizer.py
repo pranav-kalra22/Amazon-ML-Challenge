@@ -16,11 +16,14 @@ LEGAL_TERMS = {
     # US / UK / Commonwealth
     "inc", "incorporated", "llc", "corp", "corporation", "ltd", "limited",
     "pvt", "private", "co", "company", "llp", "plc", "holdings", "holding",
-    "group", "enterprises", "enterprise", "solutions", "services", "technologies",
+    "group", "enterprises", "enterprise", "solutions", "services", "service", "technologies",
     "associates", "partners", "intl", "international", "usa", "india",
     # French / European
     "sarl", "sasu", "eurl", "sa", "gmbh", "bv", "nv", "snc", "scs", "sca",
-    "association", "ets", "etablissement", "cie"
+    "association", "ets", "etablissement", "cie",
+    # Universal grammatical / web noise tokens that are non-discriminative
+    "and", "the", "of", "in", "for", "to", "at", "by", "from", "with",
+    "com", "net", "org", "co", "www", "online", "global"
 }
 
 DOMAIN_EXT_REGEX = re.compile(
@@ -165,7 +168,9 @@ COMMON_ADDR_STOP = {
     "unit", "suite", "ste", "apt", "apartment", "fl", "floor", "bldg", "building",
     "near", "opp", "opposite", "dist", "district", "post", "po", "box", "hwy", "highway",
     "state", "city", "county", "sector", "plot", "flat", "gali", "colony", "nagar",
-    "west", "east", "north", "south", "central", "first", "second", "third"
+    "west", "east", "north", "south", "central", "first", "second", "third",
+    # Building/unit prefix labels that are not street identifiers
+    "no", "num", "number", "house", "shop", "office", "room", "khasra", "survey", "gala", "cabin", "hall"
 }
 
 
