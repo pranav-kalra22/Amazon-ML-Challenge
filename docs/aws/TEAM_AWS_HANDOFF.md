@@ -49,12 +49,20 @@ pytest -v
 ```
 *Verify that all 46 tests pass before proceeding.*
 
-### 3. Stage Training Dataset from S3
+### 3. Stage Training Dataset (S3 or Git LFS)
 
+**Option A: Sync from S3 (Recommended for Cloud)**
 ```bash
 export S3_BUCKET="<YOUR_AUTHORIZED_BUCKET>"
 mkdir -p dataset/train
 aws s3 sync s3://${S3_BUCKET}/amazon-ml-challenge/dataset/ dataset/train/
+ls -lh dataset/train/
+```
+
+**Option B: Unpack directly from Git LFS zip**
+If `git lfs pull` was used during clone:
+```bash
+unzip -q 6ab10eb3b23ba_student_resource.zip
 ls -lh dataset/train/
 ```
 
