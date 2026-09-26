@@ -3,7 +3,7 @@
   "timestamp": "2026-09-26T05:21:41Z",
   "validation_split": "val_50k_seed42",
   "code_commit": "697d5e1",
-  "results_commit": "pending",
+  "results_commit": "d2db696",
   "git_dirty": false,
   "config_file": "configs/blocking/blocking_v03.yaml",
   "total_validation_s1_entities": 50000,
