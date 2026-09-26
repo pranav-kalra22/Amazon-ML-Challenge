@@ -598,17 +598,18 @@ def run_cloud_benchmark(
     full_cov_count = 0
     non_singleton_count = 0
 
+    mode_a_hit_pairs = set(final_result.gt_hits.keys())
     for s1_idx, rec in enumerate(val_s1_records):
         s1_id = rec["entity_id"]
         truth_set = val_gt.get(s1_id, set())
         if len(truth_set) > 0:
             non_singleton_count += 1
 
-        cand_set = set(final_result[s1_idx].keys())
-        hit_set = truth_set & cand_set
+        # Mode A Ceiling: all true links retrieved unconditionally in gt_hits
+        hit_set = {cid for cid in truth_set if (s1_idx, cid) in mode_a_hit_pairs}
         oracle_preds[s1_id] = hit_set
 
-        if len(truth_set) > 0 and truth_set.issubset(cand_set):
+        if len(truth_set) > 0 and truth_set.issubset(hit_set):
             full_cov_count += 1
 
     full_coverage_rate = full_cov_count / non_singleton_count if non_singleton_count > 0 else 1.0
@@ -641,7 +642,7 @@ def run_cloud_benchmark(
 
     # Cardinality & Zero-Candidate Audits
     cardinality_breakdown = compute_cardinality_breakdown(val_gt, oracle_preds, metadata_map)
-    cand_counts_arr = np.array([len(d) for d in final_result], dtype=np.int32)
+    cand_counts_arr = final_result.uncapped_counts if (is_parity and final_result.uncapped_counts is not None) else np.array([len(d) for d in final_result], dtype=np.int32)
     zero_cand_audit = compute_zero_candidate_audit(val_gt, cand_counts_arr, [r["entity_id"] for r in val_s1_records])
 
     cand_stats = {
