@@ -1,0 +1,36 @@
+# Large Datasets
+dataset/
+**/dataset/
+*.tsv
+*.csv
+*.parquet
+*.zip
+*.gz
+*.tar
+
+# Model artifacts & generated outputs
+models/
+output/
+scratch/
+*.joblib
+*.pkl
+*.model
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# OS metadata & IDE files
+.DS_Store
+__MACOSX/
+Thumbs.db
+.vscode/
+.idea/
