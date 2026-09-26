@@ -34,12 +34,15 @@ from src.blocking.normalizer import (
 )
 
 # Channel bitmasks
-CH_A = 1    # Exact normalized name
-CH_B = 2    # Compact / domain name
-CH_C2 = 4   # Candidate-DF-aware rare token
-CH_D2 = 8   # True address-only rescue
-CH_E2 = 16  # Symmetric cross-script transliteration
-CH_F = 32   # Order-invariant distinctive token pairs
+CH_A = 1       # Exact normalized name
+CH_B = 2       # Compact / domain name
+CH_C2 = 4      # Candidate-DF-aware rare token
+CH_D2 = 8      # True address-only rescue
+CH_E2 = 16     # Symmetric cross-script transliteration
+CH_F = 32      # Order-invariant distinctive token pairs
+CH_G_NAME = 64 # Character n-gram TF-IDF approximate name
+CH_G_ADDR = 128 # Character n-gram TF-IDF approximate address
+CH_G_TRANS = 256 # Character n-gram TF-IDF approximate transliterated name
 
 CHANNEL_NAMES = {
     CH_A: "A",
@@ -47,7 +50,10 @@ CHANNEL_NAMES = {
     CH_C2: "C2",
     CH_D2: "D2",
     CH_E2: "E2",
-    CH_F: "F"
+    CH_F: "F",
+    CH_G_NAME: "G_NAME",
+    CH_G_ADDR: "G_ADDR",
+    CH_G_TRANS: "G_TRANS"
 }
 
 
@@ -192,7 +198,8 @@ class MultiChannelBlocker:
         ranking_cfg = self.config.get("candidate_ranking", {})
         self.ranking_enabled = ranking_cfg.get("enabled", True)
         self.weights = ranking_cfg.get("channel_weights", {
-            "CH_A": 10.0, "CH_B": 8.0, "CH_C2": 5.0, "CH_D2": 6.0, "CH_E2": 7.0, "CH_F": 5.0
+            "CH_A": 10.0, "CH_B": 8.0, "CH_C2": 5.0, "CH_D2": 6.0, "CH_E2": 7.0, "CH_F": 5.0,
+            "CH_G_NAME": 4.0, "CH_G_ADDR": 4.0, "CH_G_TRANS": 4.0
         })
         self.multi_channel_bonus = ranking_cfg.get("multi_channel_bonus", 2.0)
 
@@ -498,6 +505,9 @@ class MultiChannelBlocker:
             CH_D2: np.zeros(n_s1, dtype=np.int32),
             CH_E2: np.zeros(n_s1, dtype=np.int32),
             CH_F: np.zeros(n_s1, dtype=np.int32),
+            CH_G_NAME: np.zeros(n_s1, dtype=np.int32),
+            CH_G_ADDR: np.zeros(n_s1, dtype=np.int32),
+            CH_G_TRANS: np.zeros(n_s1, dtype=np.int32),
         }
 
         total_scanned = 0
@@ -627,7 +637,7 @@ class MultiChannelBlocker:
                         for s1_idx, bitmask in row_s1_matches.items():
                             # 1. Uncapped volume accounting
                             uncapped_counts[s1_idx] += 1
-                            for b in (CH_A, CH_B, CH_C2, CH_D2, CH_E2, CH_F):
+                            for b in (CH_A, CH_B, CH_C2, CH_D2, CH_E2, CH_F, CH_G_NAME, CH_G_ADDR, CH_G_TRANS):
                                 if bitmask & b:
                                     uncapped_channel_counts[b][s1_idx] += 1
 
@@ -693,6 +703,15 @@ class MultiChannelBlocker:
             channels_active += 1
         if bitmask & CH_F:
             score += self.weights.get("CH_F", 5.0)
+            channels_active += 1
+        if bitmask & CH_G_NAME:
+            score += self.weights.get("CH_G_NAME", 4.0)
+            channels_active += 1
+        if bitmask & CH_G_ADDR:
+            score += self.weights.get("CH_G_ADDR", 4.0)
+            channels_active += 1
+        if bitmask & CH_G_TRANS:
+            score += self.weights.get("CH_G_TRANS", 4.0)
             channels_active += 1
 
         if channels_active > 1:

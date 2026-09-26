@@ -1,0 +1,133 @@
+name: "EXP_004_cloud_ngram_tfidf_blocker"
+description: "Authoritative candidate generation combining EXP_003 lexical channels (A, B, C2, D2, E2, F) with scalable character TF-IDF sparse Top-N approximate retrieval channels (G_NAME, G_ADDR, G_TRANS) partitioned by country x candidate source."
+version: 4.0
+
+country_partitioning:
+  enabled: true
+  open_set: true
+
+candidate_source_partitioning:
+  enabled: true
+  sources: ["S2", "S3"]
+
+# EXP_003 Lexical Blocking Channels (preserved intact)
+channels:
+  channel_A_exact_name:
+    enabled: true
+    description: "Exact normalized and legal-stripped business name"
+  channel_B_compact_domain:
+    enabled: true
+    description: "Compact alphanumeric and domain-root representations"
+  channel_C2_candidate_df_rare_token:
+    enabled: true
+    description: "Candidate-population-aware rare distinctive name tokens"
+    min_token_len: 4
+    max_candidate_df: 5
+    max_tokens_per_entity: 2
+  channel_D2_address_rescue:
+    enabled: true
+    description: "True address-only rescue channels independent of business name"
+    exact_normalized: true
+    compact_normalized: true
+    building_and_street: true
+    postal_and_street: true
+    address_token_pair: true
+    address_token_max_candidate_df: 25
+    address_token_min_len: 4
+  channel_E2_symmetric_transliteration:
+    enabled: true
+    description: "Symmetric cross-script transliteration and transliterated token keys"
+    token_min_len: 3
+    max_candidate_df: 5
+  channel_F_order_invariant_name:
+    enabled: true
+    description: "Order-invariant rare token pairs from business name"
+    max_candidate_df: 25
+    max_pairs_per_entity: 3
+
+# EXP_004 Character N-Gram TF-IDF Approximate Retrieval Channels
+tfidf_retrieval:
+  enabled: true
+  channel_G_name_char_tfidf:
+    enabled: true
+    description: "Character n-gram TF-IDF approximate name retrieval"
+    analyzer: "char_wb"
+    ngram_min: 3
+    ngram_max: 5
+    min_df: 2
+    max_df: 0.98
+    max_features: null
+    sublinear_tf: true
+    norm: "l2"
+    dtype: "float32"
+    retrieval_top_k: 50
+    similarity_threshold: 0.35
+    representations: ["norm_unicode", "legal_stripped"]
+
+  channel_G_address_char_tfidf:
+    enabled: true
+    description: "Character n-gram TF-IDF approximate address retrieval (preserves digits and locality)"
+    analyzer: "char_wb"
+    ngram_min: 3
+    ngram_max: 5
+    min_df: 2
+    max_df: 0.98
+    max_features: null
+    sublinear_tf: true
+    norm: "l2"
+    dtype: "float32"
+    retrieval_top_k: 50
+    similarity_threshold: 0.40
+    representations: ["norm_unicode"]
+
+  channel_G_transliterated_char_tfidf:
+    enabled: true
+    description: "Character n-gram TF-IDF approximate transliterated name retrieval"
+    analyzer: "char_wb"
+    ngram_min: 3
+    ngram_max: 5
+    min_df: 2
+    max_df: 0.98
+    max_features: null
+    sublinear_tf: true
+    norm: "l2"
+    dtype: "float32"
+    retrieval_top_k: 50
+    similarity_threshold: 0.35
+    representations: ["transliterated"]
+
+execution:
+  batch_size: 5000
+  n_threads: 8
+  cache_dir: "cache/tfidf"
+  memory_safety:
+    max_ram_gb: 55.0
+    abort_on_limit: true
+
+sweeps:
+  top_k_sweep: [10, 25, 50, 100]
+  threshold_sweep: [0.30, 0.35, 0.40, 0.50, 0.60]
+
+candidate_ranking:
+  enabled: true
+  channel_weights:
+    CH_A: 10.0
+    CH_B: 8.0
+    CH_C2: 5.0
+    CH_D2: 6.0
+    CH_E2: 7.0
+    CH_F: 5.0
+    CH_G_NAME: 4.0
+    CH_G_ADDR: 4.0
+    CH_G_TRANS: 4.0
+  multi_channel_bonus: 2.0
+  tie_break: "entity_id_asc"
+
+constraints:
+  max_heap_k: 2000
+  production_caps: [2000, 1000, 500, 250, 100]
+
+success_gate:
+  min_oracle_macro_f05: 0.995
+  preferred_oracle_macro_f05: 0.997
+  target_link_recall: 0.95
