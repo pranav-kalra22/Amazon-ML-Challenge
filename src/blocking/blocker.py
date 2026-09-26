@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Channel Candidate Blocker for Business Entity Resolution — EXP_002.
+Multi-Channel Candidate Blocker for Business Entity Resolution — EXP_003.
 
 Implements a union of independently measurable blocking channels:
 - Channel A (bit 1): Exact normalized name (legal-stripped, punct-norm)
@@ -11,7 +11,8 @@ Implements a union of independently measurable blocking channels:
 - Channel F (bit 32): Order-invariant distinctive token pairs
 
 Strictly enforces open-set country equality (US -> US, India -> India, France -> France).
-Supports authoritative YAML configuration, 2-pass candidate-DF streaming, and deterministic evidence ranking.
+Supports authoritative YAML configuration, 2-pass candidate-DF streaming,
+Mode A unbounded ceiling evaluation, and Mode B bounded evidence-ranked candidate heaps.
 """
 
 import os
@@ -19,7 +20,9 @@ import sys
 sys.path.insert(0, ".")
 import re
 import time
+import heapq
 import yaml
+import numpy as np
 from collections import defaultdict
 from typing import Dict, Set, List, Tuple, Any, Optional
 
@@ -48,11 +51,68 @@ CHANNEL_NAMES = {
 }
 
 
+class CandidateHeapItem:
+    """
+    Candidate element stored in a bounded min-heap for Top-K evidence ranking.
+    Min-heap ordering prioritizes evicting:
+    1. Lower evidence scores first.
+    2. For equal scores, lexicographically LARGER candidate IDs first (so smaller IDs are kept).
+    """
+    __slots__ = ("score", "cand_id", "bitmask")
+
+    def __init__(self, score: float, cand_id: str, bitmask: int):
+        self.score = score
+        self.cand_id = cand_id
+        self.bitmask = bitmask
+
+    def __lt__(self, other: "CandidateHeapItem") -> bool:
+        if self.score != other.score:
+            return self.score < other.score
+        return self.cand_id > other.cand_id
+
+    def __gt__(self, other: "CandidateHeapItem") -> bool:
+        if self.score != other.score:
+            return self.score > other.score
+        return self.cand_id < other.cand_id
+
+    def __le__(self, other: "CandidateHeapItem") -> bool:
+        return not (self > other)
+
+    def __ge__(self, other: "CandidateHeapItem") -> bool:
+        return not (self < other)
+
+    def __eq__(self, other: "CandidateHeapItem") -> bool:
+        return self.score == other.score and self.cand_id == other.cand_id
+
+
+class StreamingCandidateResult(list):
+    """
+    Subclasses list so candidates[s1_idx] returns {cand_id: bitmask}
+    maintaining 100% backward compatibility with all existing tests and scripts,
+    while also exposing Mode A ceiling gt_hits, bounded heaps, and uncapped counts.
+    """
+    def __init__(
+        self,
+        candidate_dicts: List[Dict[str, int]],
+        heaps: Optional[List[List[CandidateHeapItem]]] = None,
+        gt_hits: Optional[Dict[Tuple[int, str], int]] = None,
+        uncapped_counts: Optional[np.ndarray] = None,
+        uncapped_channel_counts: Optional[Dict[int, np.ndarray]] = None,
+        total_scanned: int = 0
+    ):
+        super().__init__(candidate_dicts)
+        self.heaps = heaps if heaps is not None else []
+        self.gt_hits = gt_hits if gt_hits is not None else {}
+        self.uncapped_counts = uncapped_counts
+        self.uncapped_channel_counts = uncapped_channel_counts if uncapped_channel_counts is not None else {}
+        self.total_scanned = total_scanned
+
+
 class MultiChannelBlocker:
     """
     Multi-channel candidate generator implementing Channels A, B, C2, D2, E2, F.
     Uses authoritative YAML configuration, streaming 2-pass candidate DF,
-    and deterministic candidate evidence ranking.
+    Mode A unbounded ceiling evaluation, and Mode B bounded evidence-ranked heaps.
     """
     def __init__(
         self,
@@ -67,7 +127,7 @@ class MultiChannelBlocker:
         else:
             # Fallback default configuration
             self.config = {
-                "name": "EXP_002_default",
+                "name": "EXP_003_default",
                 "channels": {
                     "channel_A_exact_name": {"enabled": True},
                     "channel_B_compact_domain": {"enabled": True},
@@ -79,7 +139,7 @@ class MultiChannelBlocker:
                         "building_and_street": True, "postal_and_street": True, "address_token_pair": True,
                         "address_token_max_candidate_df": 25, "address_token_min_len": 4
                     },
-                    "channel_E2_symmetric_transliteration": {"enabled": True, "token_min_len": 3},
+                    "channel_E2_symmetric_transliteration": {"enabled": True, "token_min_len": 3, "max_candidate_df": 5},
                     "channel_F_order_invariant_name": {
                         "enabled": True, "max_candidate_df": 25, "max_pairs_per_entity": 3
                     }
@@ -93,8 +153,8 @@ class MultiChannelBlocker:
                     "tie_break": "entity_id_asc"
                 },
                 "constraints": {
-                    "max_candidates_per_entity": None,
-                    "diagnostic_caps": [None, 500, 250, 100, 50, 30]
+                    "max_heap_k": 2000,
+                    "production_caps": [2000, 1000, 500, 250, 100]
                 }
             }
 
@@ -122,6 +182,7 @@ class MultiChannelBlocker:
         e2_cfg = ch_cfg.get("channel_E2_symmetric_transliteration", {})
         self.ch_E2_enabled = e2_cfg.get("enabled", True)
         self.e2_min_len = e2_cfg.get("token_min_len", 3)
+        self.e2_max_df = e2_cfg.get("max_candidate_df", self.c2_max_df)
 
         f_cfg = ch_cfg.get("channel_F_order_invariant_name", {})
         self.ch_F_enabled = f_cfg.get("enabled", True)
@@ -135,6 +196,9 @@ class MultiChannelBlocker:
         })
         self.multi_channel_bonus = ranking_cfg.get("multi_channel_bonus", 2.0)
 
+        constraints_cfg = self.config.get("constraints", {})
+        self.max_heap_k = constraints_cfg.get("max_heap_k", 2000)
+
         # Inverted index: (channel_bit, country, key_str) -> list of s1_int_indices
         self.query_index = defaultdict(list)
         self.s1_id_to_idx = {}
@@ -143,24 +207,28 @@ class MultiChannelBlocker:
         
         # Candidate-population DF counters
         self.candidate_name_df = defaultdict(int)
+        self.candidate_trans_df = defaultdict(int)
         self.candidate_addr_df = defaultdict(int)
+        self.candidate_df_measured = False
 
     def scan_candidate_token_frequencies(
         self,
         candidate_file_paths: List[str],
         tracked_name_tokens: Set[str],
+        tracked_trans_tokens: Set[str],
         tracked_addr_tokens: Set[str],
         progress_interval: int = 1000000
     ):
         """
         Pass 1: Streams through candidate source files (S2 and S3) and counts
-        document frequencies strictly for S1 tracked name and address tokens.
-        Memory-efficient: tracks only tokens appearing in the S1 query set.
+        document frequencies strictly for S1 tracked name, transliterated, and address tokens.
+        Ensures non-Latin candidates are transliterated through the exact same normalization pipeline.
         """
         print(f"\n[PASS 1] Scanning candidate token frequencies across {len(candidate_file_paths)} candidate files...", flush=True)
-        print(f"  Tracking {len(tracked_name_tokens):,} S1 name tokens and {len(tracked_addr_tokens):,} S1 address tokens...", flush=True)
+        print(f"  Tracking {len(tracked_name_tokens):,} name, {len(tracked_trans_tokens):,} transliterated, and {len(tracked_addr_tokens):,} address tokens...", flush=True)
         t0 = time.time()
         total_rows = 0
+        self.candidate_df_measured = True
 
         for path in candidate_file_paths:
             t_file = time.time()
@@ -181,9 +249,20 @@ class MultiChannelBlocker:
                     raw_addr = parts[col_addr]
 
                     # Tokenize name
-                    name_toks = set(re.findall(r'[a-z0-9]{3,}', raw_name.lower())) - LEGAL_TERMS
-                    for tok in name_toks.intersection(tracked_name_tokens):
-                        self.candidate_name_df[tok] += 1
+                    if raw_name:
+                        if raw_name.isascii():
+                            name_toks = set(re.findall(r'[a-z0-9]{3,}', raw_name.lower())) - LEGAL_TERMS
+                            for tok in name_toks.intersection(tracked_name_tokens):
+                                self.candidate_name_df[tok] += 1
+                            for tok in name_toks.intersection(tracked_trans_tokens):
+                                self.candidate_trans_df[tok] += 1
+                        else:
+                            # Non-Latin candidate: normalize through exact same pipeline
+                            norm_cand = normalize_name_non_destructive(raw_name)
+                            for tok in set(norm_cand["distinctive_tokens"]).intersection(tracked_name_tokens):
+                                self.candidate_name_df[tok] += 1
+                            for tok in set(norm_cand["trans_distinctive_tokens"]).intersection(tracked_trans_tokens):
+                                self.candidate_trans_df[tok] += 1
 
                     # Tokenize address
                     if raw_addr and raw_addr.lower() not in {"", "nan", "<null>", "null", "none"}:
@@ -198,7 +277,7 @@ class MultiChannelBlocker:
             print(f"  Completed {os.path.basename(path)}: {rows_file:,} rows in {time.time()-t_file:.2f}s", flush=True)
 
         print(f"[PASS 1 COMPLETE] Scanned {total_rows:,} total rows in {time.time()-t0:.2f}s.", flush=True)
-        print(f"  Measured candidate DF for {len(self.candidate_name_df):,} name tokens and {len(self.candidate_addr_df):,} address tokens.", flush=True)
+        print(f"  Measured candidate DF for {len(self.candidate_name_df):,} name, {len(self.candidate_trans_df):,} transliterated, and {len(self.candidate_addr_df):,} address tokens.", flush=True)
 
     def build_query_index(
         self,
@@ -218,6 +297,7 @@ class MultiChannelBlocker:
         # Step 1: Pre-normalize all S1 records
         normalized_data = []
         tracked_name_tokens = set()
+        tracked_trans_tokens = set()
         tracked_addr_tokens = set()
 
         for r in s1_records:
@@ -228,15 +308,22 @@ class MultiChannelBlocker:
             for tok in n["distinctive_tokens"]:
                 if len(tok) >= self.c2_min_len and tok not in LEGAL_TERMS:
                     tracked_name_tokens.add(tok)
+            for ttok in n["trans_distinctive_tokens"]:
+                if len(ttok) >= self.e2_min_len and ttok not in LEGAL_TERMS:
+                    tracked_trans_tokens.add(ttok)
             for tok in a["distinctive_tokens"]:
                 if len(tok) >= self.d2_addr_min_len and tok not in COMMON_ADDR_STOP and tok not in LEGAL_TERMS:
                     tracked_addr_tokens.add(tok)
+            for tok in a["street_tokens"]:
+                if len(tok) >= 4 and tok not in COMMON_ADDR_STOP and tok not in LEGAL_TERMS:
+                    tracked_addr_tokens.add(tok)
 
         # Step 2: Pass 1 — Stream candidate files to count frequencies if paths provided
-        if candidate_file_paths and (self.ch_C2_enabled or self.ch_D2_enabled or self.ch_F_enabled):
+        if candidate_file_paths and (self.ch_C2_enabled or self.ch_D2_enabled or self.ch_E2_enabled or self.ch_F_enabled):
             self.scan_candidate_token_frequencies(
                 candidate_file_paths,
                 tracked_name_tokens,
+                tracked_trans_tokens,
                 tracked_addr_tokens
             )
 
@@ -267,10 +354,16 @@ class MultiChannelBlocker:
 
             # Channel C2: Candidate-DF-Aware Rare Distinctive Name Tokens (Bit 4)
             if self.ch_C2_enabled:
-                c2_cand_tokens = [
-                    t for t in n["distinctive_tokens"]
-                    if len(t) >= self.c2_min_len and t not in LEGAL_TERMS and self.candidate_name_df[t] <= self.c2_max_df
-                ]
+                if self.candidate_df_measured:
+                    c2_cand_tokens = [
+                        t for t in n["distinctive_tokens"]
+                        if len(t) >= self.c2_min_len and t not in LEGAL_TERMS and self.candidate_name_df[t] <= self.c2_max_df
+                    ]
+                else:
+                    c2_cand_tokens = [
+                        t for t in n["distinctive_tokens"]
+                        if len(t) >= self.c2_min_len and t not in LEGAL_TERMS
+                    ]
                 if c2_cand_tokens:
                     c2_cand_tokens.sort(key=lambda t: (self.candidate_name_df[t], -len(t)))
                     for rt in c2_cand_tokens[:self.c2_max_tokens]:
@@ -297,23 +390,31 @@ class MultiChannelBlocker:
                 # 4. Building numeric + street token (ONLY if street token is selective)
                 if self.d2_bldg_street and a["building_numeric"]:
                     for st in a["street_tokens"][:2]:
-                        if len(st) >= 4 and st not in COMMON_ADDR_STOP and self.candidate_addr_df[st] <= self.d2_addr_max_df:
-                            self.query_index[(CH_D2, c, f"bs_{a['building_numeric']}_{st}")].append(s1_idx)
-                            ch_counts[CH_D2] += 1
+                        if len(st) >= 4 and st not in COMMON_ADDR_STOP:
+                            if not self.candidate_df_measured or self.candidate_addr_df[st] <= self.d2_addr_max_df:
+                                self.query_index[(CH_D2, c, f"bs_{a['building_numeric']}_{st}")].append(s1_idx)
+                                ch_counts[CH_D2] += 1
 
                 # 5. Postal / PIN + street token (ONLY if street token is selective)
                 if self.d2_postal_street and a["postal_code"]:
                     for st in a["street_tokens"][:2]:
-                        if len(st) >= 4 and st not in COMMON_ADDR_STOP and self.candidate_addr_df[st] <= self.d2_addr_max_df:
-                            self.query_index[(CH_D2, c, f"ps_{a['postal_code']}_{st}")].append(s1_idx)
-                            ch_counts[CH_D2] += 1
+                        if len(st) >= 4 and st not in COMMON_ADDR_STOP:
+                            if not self.candidate_df_measured or self.candidate_addr_df[st] <= self.d2_addr_max_df:
+                                self.query_index[(CH_D2, c, f"ps_{a['postal_code']}_{st}")].append(s1_idx)
+                                ch_counts[CH_D2] += 1
 
                 # 6. Distinctive address token pairs (sorted, both selective)
                 if self.d2_addr_pair:
-                    valid_addr_toks = [
-                        t for t in a["distinctive_tokens"]
-                        if len(t) >= self.d2_addr_min_len and t not in COMMON_ADDR_STOP and self.candidate_addr_df[t] <= 15
-                    ]
+                    if self.candidate_df_measured:
+                        valid_addr_toks = [
+                            t for t in a["distinctive_tokens"]
+                            if len(t) >= self.d2_addr_min_len and t not in COMMON_ADDR_STOP and self.candidate_addr_df[t] <= 15
+                        ]
+                    else:
+                        valid_addr_toks = [
+                            t for t in a["distinctive_tokens"]
+                            if len(t) >= self.d2_addr_min_len and t not in COMMON_ADDR_STOP
+                        ]
                     if len(valid_addr_toks) >= 2:
                         valid_addr_toks.sort(key=lambda t: self.candidate_addr_df[t])
                         t1 = valid_addr_toks[0]
@@ -331,22 +432,29 @@ class MultiChannelBlocker:
                 if len(n["trans_compact"]) >= 6:
                     self.query_index[(CH_E2, c, n["trans_compact"])].append(s1_idx)
                     ch_counts[CH_E2] += 1
-                # Transliterated distinctive tokens (strictly selective)
+                # Transliterated distinctive tokens (strictly selective with transliteration candidate DF)
                 for ttok in n["trans_distinctive_tokens"]:
-                    if len(ttok) >= self.e2_min_len and ttok not in LEGAL_TERMS and self.candidate_name_df[ttok] <= self.c2_max_df:
-                        self.query_index[(CH_E2, c, f"ttok_{ttok}")].append(s1_idx)
-                        ch_counts[CH_E2] += 1
+                    if len(ttok) >= self.e2_min_len and ttok not in LEGAL_TERMS:
+                        if not self.candidate_df_measured or self.candidate_trans_df[ttok] <= self.e2_max_df:
+                            self.query_index[(CH_E2, c, f"ttok_{ttok}")].append(s1_idx)
+                            ch_counts[CH_E2] += 1
 
             # Channel F: Order-Invariant Name Token Pairs (Bit 32)
             if self.ch_F_enabled:
-                dtoks = [
-                    t for t in n["distinctive_tokens"]
-                    if len(t) >= 4 and t not in LEGAL_TERMS and self.candidate_name_df[t] <= self.f_max_df
-                ]
+                if self.candidate_df_measured:
+                    dtoks = [
+                        t for t in n["distinctive_tokens"]
+                        if len(t) >= 4 and t not in LEGAL_TERMS and self.candidate_name_df[t] <= self.f_max_df
+                    ]
+                else:
+                    dtoks = [
+                        t for t in n["distinctive_tokens"]
+                        if len(t) >= 4 and t not in LEGAL_TERMS
+                    ]
                 if len(dtoks) >= 2:
                     dtoks.sort(key=lambda t: self.candidate_name_df[t])
-                    # Require at least one token to have DF <= 10
-                    if self.candidate_name_df[dtoks[0]] <= 10:
+                    # Require at least one token to have DF <= 10 when measured
+                    if not self.candidate_df_measured or self.candidate_name_df[dtoks[0]] <= 10:
                         t1 = dtoks[0]
                         pairs_indexed = 0
                         for t2 in dtoks[1:]:
@@ -365,23 +473,40 @@ class MultiChannelBlocker:
         self,
         candidate_file_paths: List[str],
         progress_interval: int = 1000000,
-        max_streaming_candidates_per_entity: int = 1500
-    ) -> List[Dict[str, int]]:
+        max_streaming_candidates_per_entity: Optional[int] = None,
+        max_heap_k: Optional[int] = 2000,
+        gt_links_set: Optional[Set[Tuple[int, str]]] = None
+    ) -> StreamingCandidateResult:
         """
         Pass 2: Streams through candidate files and queries the inverted index.
-        Applies a streaming safety cap (default 1,500 candidates per entity) to prevent runaway inflation.
+        Executes:
+        - Mode A (Ceiling Mode): If gt_links_set provided, records true links hit unconditionally without any caps.
+        - Mode B (Ranked Production Mode): Maintains bounded Top-K heaps per entity based on deterministic evidence score.
+        - Exact uncapped candidate volume counting per entity.
         """
         n_s1 = len(self.idx_to_s1_id)
-        candidates = [{} for _ in range(n_s1)]
+        # Determine heap K limit
+        effective_k = max_heap_k if max_heap_k is not None else max_streaming_candidates_per_entity
+
+        heaps: List[List[CandidateHeapItem]] = [[] for _ in range(n_s1)]
+        gt_hits: Dict[Tuple[int, str], int] = defaultdict(int) if gt_links_set is not None else {}
+        uncapped_counts = np.zeros(n_s1, dtype=np.int32)
+        uncapped_channel_counts = {
+            CH_A: np.zeros(n_s1, dtype=np.int32),
+            CH_B: np.zeros(n_s1, dtype=np.int32),
+            CH_C2: np.zeros(n_s1, dtype=np.int32),
+            CH_D2: np.zeros(n_s1, dtype=np.int32),
+            CH_E2: np.zeros(n_s1, dtype=np.int32),
+            CH_F: np.zeros(n_s1, dtype=np.int32),
+        }
+
         total_scanned = 0
         t_start = time.time()
 
-        def _add_candidate(s1_i: int, cid: str, bit: int):
-            c_dict = candidates[s1_i]
-            if len(c_dict) < max_streaming_candidates_per_entity or cid in c_dict:
-                c_dict[cid] = c_dict.get(cid, 0) | bit
-
         print(f"\n[PASS 2] Streaming candidates and querying multi-channel index...", flush=True)
+        if gt_links_set is not None:
+            print(f"  Mode A (Ceiling Mode): tracking {len(gt_links_set):,} ground-truth pairs unconditionally.", flush=True)
+        print(f"  Mode B (Ranked Heap Mode): bounded top-K heap per entity with K={effective_k}.", flush=True)
 
         for path in candidate_file_paths:
             print(f"Streaming candidate population from {path}...", flush=True)
@@ -408,34 +533,35 @@ class MultiChannelBlocker:
                     raw_addr = parts[col_addr]
 
                     n = normalize_name_non_destructive(raw_name)
+                    row_s1_matches = {}
 
                     # Channel A: Exact Normalized Name (Bit 1)
                     if self.ch_A_enabled:
                         if n["legal_stripped"]:
                             for s1_idx in self.query_index.get((CH_A, c, n["legal_stripped"]), []):
-                                _add_candidate(s1_idx, cand_id, CH_A)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_A
                         if n["punct_norm"] and n["punct_norm"] != n["legal_stripped"]:
                             for s1_idx in self.query_index.get((CH_A, c, n["punct_norm"]), []):
-                                _add_candidate(s1_idx, cand_id, CH_A)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_A
 
                     # Channel B: Compact & Domain (Bit 2)
                     if self.ch_B_enabled:
                         if len(n["compact_alnum"]) >= 4:
                             for s1_idx in self.query_index.get((CH_B, c, n["compact_alnum"]), []):
-                                _add_candidate(s1_idx, cand_id, CH_B)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
                         if len(n["legal_stripped_compact"]) >= 4 and n["legal_stripped_compact"] != n["compact_alnum"]:
                             for s1_idx in self.query_index.get((CH_B, c, n["legal_stripped_compact"]), []):
-                                _add_candidate(s1_idx, cand_id, CH_B)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
                         if n["domain_root"] and len(n["domain_root"]) >= 4:
                             for s1_idx in self.query_index.get((CH_B, c, n["domain_root"]), []):
-                                _add_candidate(s1_idx, cand_id, CH_B)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
 
                     # Channel C2: Candidate-DF Rare Token (Bit 4)
                     if self.ch_C2_enabled:
                         for tok in n["distinctive_tokens"]:
                             if len(tok) >= self.c2_min_len:
                                 for s1_idx in self.query_index.get((CH_C2, c, tok), []):
-                                    _add_candidate(s1_idx, cand_id, CH_C2)
+                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_C2
 
                     # Channel D2: True Address-Only Rescue (Bit 8)
                     if self.ch_D2_enabled and raw_addr and raw_addr.lower() not in {"", "nan", "<null>", "null", "none"}:
@@ -443,27 +569,27 @@ class MultiChannelBlocker:
                         # Exact & compact
                         if self.d2_exact and len(a["norm_unicode"]) >= 12:
                             for s1_idx in self.query_index.get((CH_D2, c, f"exact_{a['norm_unicode']}"), []):
-                                _add_candidate(s1_idx, cand_id, CH_D2)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
                         if self.d2_compact and len(a["compact_norm"]) >= 15:
                             for s1_idx in self.query_index.get((CH_D2, c, f"compact_{a['compact_norm']}"), []):
-                                _add_candidate(s1_idx, cand_id, CH_D2)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
 
                         # Building + Postal
                         if a["building_numeric"] and a["postal_code"]:
                             for s1_idx in self.query_index.get((CH_D2, c, f"bp_{a['building_numeric']}_{a['postal_code']}"), []):
-                                _add_candidate(s1_idx, cand_id, CH_D2)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
 
                         # Building + street
                         if self.d2_bldg_street and a["building_numeric"]:
                             for st in a["street_tokens"][:2]:
                                 for s1_idx in self.query_index.get((CH_D2, c, f"bs_{a['building_numeric']}_{st}"), []):
-                                    _add_candidate(s1_idx, cand_id, CH_D2)
+                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
 
                         # Postal + street
                         if self.d2_postal_street and a["postal_code"]:
                             for st in a["street_tokens"][:2]:
                                 for s1_idx in self.query_index.get((CH_D2, c, f"ps_{a['postal_code']}_{st}"), []):
-                                    _add_candidate(s1_idx, cand_id, CH_D2)
+                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
 
                         # Address token pairs
                         if self.d2_addr_pair and len(a["distinctive_tokens"]) >= 2:
@@ -472,20 +598,20 @@ class MultiChannelBlocker:
                                 for j in range(i + 1, len(dtoks_a)):
                                     pair_k = f"ap_{min(dtoks_a[i], dtoks_a[j])}_{max(dtoks_a[i], dtoks_a[j])}"
                                     for s1_idx in self.query_index.get((CH_D2, c, pair_k), []):
-                                        _add_candidate(s1_idx, cand_id, CH_D2)
+                                        row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
 
                     # Channel E2: Symmetric Transliteration (Bit 16)
                     if self.ch_E2_enabled:
                         if n["trans_stripped"]:
                             for s1_idx in self.query_index.get((CH_E2, c, n["trans_stripped"]), []):
-                                _add_candidate(s1_idx, cand_id, CH_E2)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
                         if len(n["trans_compact"]) >= 6:
                             for s1_idx in self.query_index.get((CH_E2, c, n["trans_compact"]), []):
-                                _add_candidate(s1_idx, cand_id, CH_E2)
+                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
                         for ttok in n["trans_distinctive_tokens"]:
                             if len(ttok) >= self.e2_min_len:
                                 for s1_idx in self.query_index.get((CH_E2, c, f"ttok_{ttok}"), []):
-                                    _add_candidate(s1_idx, cand_id, CH_E2)
+                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
 
                     # Channel F: Order-Invariant Name Token Pairs (Bit 32)
                     if self.ch_F_enabled and len(n["distinctive_tokens"]) >= 2:
@@ -494,8 +620,30 @@ class MultiChannelBlocker:
                             for j in range(i + 1, len(dtoks)):
                                 p_str = f"pair_{min(dtoks[i], dtoks[j])}_{max(dtoks[i], dtoks[j])}"
                                 for s1_idx in self.query_index.get((CH_F, c, p_str), []):
-                                    _add_candidate(s1_idx, cand_id, CH_F)
+                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_F
 
+                    # Process all matches for this candidate row
+                    if row_s1_matches:
+                        for s1_idx, bitmask in row_s1_matches.items():
+                            # 1. Uncapped volume accounting
+                            uncapped_counts[s1_idx] += 1
+                            for b in (CH_A, CH_B, CH_C2, CH_D2, CH_E2, CH_F):
+                                if bitmask & b:
+                                    uncapped_channel_counts[b][s1_idx] += 1
+
+                            # 2. Mode A — Unbounded Ceiling Ground-Truth Hit Recording
+                            if gt_links_set is not None and (s1_idx, cand_id) in gt_links_set:
+                                gt_hits[(s1_idx, cand_id)] |= bitmask
+
+                            # 3. Mode B — Evidence-Ranked Bounded Top-K Min-Heap
+                            score = self.compute_candidate_evidence_score(bitmask)
+                            item = CandidateHeapItem(score, cand_id, bitmask)
+                            h = heaps[s1_idx]
+
+                            if effective_k is None or len(h) < effective_k:
+                                heapq.heappush(h, item)
+                            elif item > h[0]:
+                                heapq.heapreplace(h, item)
 
                     if rows_in_file % progress_interval == 0:
                         now = time.time()
@@ -505,7 +653,21 @@ class MultiChannelBlocker:
             print(f"Finished {path}: {rows_in_file:,} rows in {time.time()-t_file:.2f}s", flush=True)
 
         print(f"\nTotal candidate scanning complete: {total_scanned:,} rows in {time.time()-t_start:.2f}s", flush=True)
-        return candidates
+
+        # Convert heaps to candidate dicts for compatibility
+        candidate_dicts = [
+            {item.cand_id: item.bitmask for item in h}
+            for h in heaps
+        ]
+
+        return StreamingCandidateResult(
+            candidate_dicts=candidate_dicts,
+            heaps=heaps,
+            gt_hits=gt_hits,
+            uncapped_counts=uncapped_counts,
+            uncapped_channel_counts=uncapped_channel_counts,
+            total_scanned=total_scanned
+        )
 
     def compute_candidate_evidence_score(self, bitmask: int) -> float:
         """
@@ -540,26 +702,32 @@ class MultiChannelBlocker:
 
     def rank_entity_candidates(
         self,
-        cand_dict: Dict[str, int],
+        cand_dict_or_heap: Any,
         cap: Optional[int] = None
     ) -> List[str]:
         """
         Deterministically ranks candidates for an S1 entity:
         1. evidence score descending
         2. candidate entity_id ascending (tie-break)
+        Supports both candidate dictionary {cand_id: bitmask} and heap List[CandidateHeapItem].
         """
-        if not cand_dict:
+        if not cand_dict_or_heap:
             return []
 
-        # (cand_id, score)
-        scored = [
-            (cid, self.compute_candidate_evidence_score(mask))
-            for cid, mask in cand_dict.items()
-        ]
-
-        # Deterministic sort: -score (highest score first), cid (alphabetical tie-break)
-        scored.sort(key=lambda x: (-x[1], x[0]))
-
-        if cap is not None:
-            return [cid for cid, _ in scored[:cap]]
-        return [cid for cid, _ in scored]
+        if isinstance(cand_dict_or_heap, list) and cand_dict_or_heap and isinstance(cand_dict_or_heap[0], CandidateHeapItem):
+            # Already scored heap items: sort best to worst
+            sorted_items = sorted(cand_dict_or_heap, key=lambda item: (-item.score, item.cand_id))
+            if cap is not None:
+                sorted_items = sorted_items[:cap]
+            return [item.cand_id for item in sorted_items]
+        elif isinstance(cand_dict_or_heap, dict):
+            scored = [
+                (cid, self.compute_candidate_evidence_score(mask))
+                for cid, mask in cand_dict_or_heap.items()
+            ]
+            scored.sort(key=lambda x: (-x[1], x[0]))
+            if cap is not None:
+                return [cid for cid, _ in scored[:cap]]
+            return [cid for cid, _ in scored]
+        else:
+            return []

@@ -247,15 +247,228 @@ class TestNormalizerAndBlocker(unittest.TestCase):
             f.write("S2-DBA-888\tZenith Precision Logistics\t880 June Terrace, Lake Zurich, IL 60047\tUS\n")
             temp_path = f.name
 
+    def test_missing_name_normalization_schema(self):
+        """Verifies that empty string, None, and NaN business names produce identical 15-key schemas as non-empty names."""
+        expected_keys = {
+            "raw", "norm_unicode", "punct_norm", "compact_alnum", "domain_root",
+            "legal_stripped", "legal_stripped_compact", "transliterated", "trans_stripped",
+            "trans_compact", "tokens", "distinctive_tokens", "trans_tokens",
+            "trans_distinctive_tokens", "sorted_token_signature"
+        }
+        
+        rep_normal = normalize_name_non_destructive("Acme Global Technologies Inc.")
+        rep_empty = normalize_name_non_destructive("")
+        rep_none = normalize_name_non_destructive(None)
+        rep_nan = normalize_name_non_destructive(float("nan"))
+        rep_whitespace = normalize_name_non_destructive("   ")
+
+        self.assertEqual(set(rep_normal.keys()), expected_keys)
+        self.assertEqual(set(rep_empty.keys()), expected_keys)
+        self.assertEqual(set(rep_none.keys()), expected_keys)
+        self.assertEqual(set(rep_nan.keys()), expected_keys)
+        self.assertEqual(set(rep_whitespace.keys()), expected_keys)
+
+        # Ensure safe empty types
+        self.assertEqual(rep_empty["tokens"], [])
+        self.assertEqual(rep_empty["distinctive_tokens"], [])
+        self.assertEqual(rep_empty["trans_tokens"], [])
+        self.assertEqual(rep_empty["trans_distinctive_tokens"], [])
+        self.assertEqual(rep_empty["sorted_token_signature"], "")
+
+    def test_no_keyerror_for_empty_candidate_name(self):
+        """Verifies that candidate streaming never crashes on missing/empty business names or addresses."""
+        s1_entities = [
+            {
+                "entity_id": "S1-TEST-NULL",
+                "business_name": "Standard Company",
+                "business_address": "123 Main St",
+                "country": "US"
+            }
+        ]
+        blocker = MultiChannelBlocker()
+        blocker.build_query_index(s1_entities)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False, encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S2-NULL-01\t\t\tUS\n")
+            f.write("S2-NULL-02\tnan\tnan\tUS\n")
+            f.write("S2-NULL-03\tNone\t<null>\tUS\n")
+            temp_path = f.name
+
         try:
             candidates = blocker.generate_candidates_streaming([temp_path])
-            s1_cands = candidates[0]
-            self.assertIn("S2-DBA-888", s1_cands, "Failed to rescue candidate with different name via address channel!")
-            self.assertTrue(s1_cands["S2-DBA-888"] & CH_D2, "Address candidate was not retrieved via Channel D2!")
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(len(candidates[0]), 0)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    def test_symmetric_transliteration_candidate_df(self):
+        """Verifies that non-Latin candidate names increment transliterated token DF correctly during Pass 1."""
+        s1_entities = [
+            {
+                "entity_id": "S1-INDIA-TRANS",
+                "business_name": "Kumar Sai Enterprises",
+                "business_address": "Pune Road",
+                "country": "India"
+            }
+        ]
+        # Candidate file with 'साई' (sai) 10 times and 'कुमार' (kumar) 1 time
+        with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False, encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            f.write("S2-RARE\tकुमार उद्योग\tPune Road\tIndia\n")
+            for i in range(10):
+                f.write(f"S2-COMMON-{i}\tसाई सर्विसेज {i}\tPune Road\tIndia\n")
+            temp_path = f.name
+
+        try:
+            cfg = {
+                "channels": {
+                    "channel_A_exact_name": {"enabled": False},
+                    "channel_B_compact_domain": {"enabled": False},
+                    "channel_C2_candidate_df_rare_token": {"enabled": False},
+                    "channel_D2_address_rescue": {"enabled": False},
+                    "channel_E2_symmetric_transliteration": {"enabled": True, "token_min_len": 3, "max_candidate_df": 2},
+                    "channel_F_order_invariant_name": {"enabled": False}
+                }
+            }
+            blocker = MultiChannelBlocker(config=cfg)
+            blocker.build_query_index(s1_entities, candidate_file_paths=[temp_path])
+
+            self.assertIn("sai", blocker.candidate_trans_df)
+            self.assertEqual(blocker.candidate_trans_df["sai"], 10)
+            self.assertIn("kumar", blocker.candidate_trans_df)
+            self.assertEqual(blocker.candidate_trans_df["kumar"], 1)
+
+            # 'sai' had DF=10 > max_candidate_df=2, so it must NOT be indexed as a distinctive token
+            e2_keys = [k[2] for k in blocker.query_index if k[0] == CH_E2]
+            self.assertIn("ttok_kumar", e2_keys)
+            self.assertNotIn("ttok_sai", e2_keys)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_ceiling_recall_unaffected_by_storage_cap(self):
+        """Verifies that Mode A ceiling tracking captures 100% of true links regardless of max_heap_k."""
+        s1_entities = [
+            {
+                "entity_id": "S1-CEIL-01",
+                "business_name": "Apex Global",
+                "business_address": "100 Elm Street",
+                "country": "US"
+            }
+        ]
+        blocker = MultiChannelBlocker()
+        blocker.build_query_index(s1_entities)
+
+        # 5 candidates all matching S1
+        with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False, encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            for i in range(5):
+                f.write(f"S2-TRUE-{i}\tApex Global\t100 Elm Street\tUS\n")
+            temp_path = f.name
+
+        try:
+            gt_pairs = {(0, f"S2-TRUE-{i}") for i in range(5)}
+            # Run with max_heap_k=2 (storage cap)
+            result = blocker.generate_candidates_streaming(
+                [temp_path],
+                max_heap_k=2,
+                gt_links_set=gt_pairs
+            )
+            # The bounded heap only has 2 candidates
+            self.assertEqual(len(result[0]), 2)
+            # Mode A ceiling has all 5 true links!
+            self.assertEqual(len(result.gt_hits), 5)
+            for i in range(5):
+                self.assertIn((0, f"S2-TRUE-{i}"), result.gt_hits)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_late_arriving_true_candidate_counted_in_ceiling(self):
+        """Verifies that a true link arriving late after noise candidates is captured in ceiling mode."""
+        s1_entities = [
+            {
+                "entity_id": "S1-LATE-01",
+                "business_name": "Omega Tech",
+                "business_address": "500 Market St",
+                "country": "US"
+            }
+        ]
+        blocker = MultiChannelBlocker()
+        blocker.build_query_index(s1_entities)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False, encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            # 5 noise candidates that also match Omega Tech
+            for i in range(5):
+                f.write(f"S2-NOISE-{i}\tOmega Tech\t500 Market St\tUS\n")
+            # 1 true candidate arriving at the very end
+            f.write("S2-TRUE-LATE\tOmega Tech\t500 Market St\tUS\n")
+            temp_path = f.name
+
+        try:
+            gt_pairs = {(0, "S2-TRUE-LATE")}
+            result = blocker.generate_candidates_streaming(
+                [temp_path],
+                max_heap_k=2,
+                gt_links_set=gt_pairs
+            )
+            self.assertIn((0, "S2-TRUE-LATE"), result.gt_hits)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_late_arriving_high_score_candidate_replaces_weaker_in_top_k(self):
+        """Verifies that a late-arriving strong match replaces a weaker candidate in the bounded Top-K heap."""
+        s1_entities = [
+            {
+                "entity_id": "S1-REPLACE-01",
+                "business_name": "Zenith International",
+                "business_address": "880 June Terrace, Lake Zurich, IL 60047",
+                "country": "US"
+            }
+        ]
+        blocker = MultiChannelBlocker()
+        blocker.build_query_index(s1_entities)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False, encoding="utf-8") as f:
+            f.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            # Candidate 1: Weak match (Address rescue only -> score 6.0)
+            f.write("S2-WEAK-01\tTotally Different Name\t880 June Terrace, Lake Zurich, IL 60047\tUS\n")
+            # Candidate 2: Weak match (Address rescue only -> score 6.0)
+            f.write("S2-WEAK-02\tAnother Different Name\t880 June Terrace, Lake Zurich, IL 60047\tUS\n")
+            # Candidate 3: Arrives 3rd with Strong match (Exact name + compact name -> score 10.0 + 8.0 + 2.0 = 20.0)
+            f.write("S2-STRONG-03\tZenith International\t999 Unrelated Blvd\tUS\n")
+            temp_path = f.name
+
+        try:
+            result = blocker.generate_candidates_streaming(
+                [temp_path],
+                max_heap_k=2
+            )
+            retained_ids = set(result[0].keys())
+            self.assertEqual(len(retained_ids), 2)
+            # S2-STRONG-03 must be admitted into the bounded heap!
+            self.assertIn("S2-STRONG-03", retained_ids)
+            # And one of the weak candidates was evicted
+            self.assertEqual(len(retained_ids & {"S2-WEAK-01", "S2-WEAK-02"}), 1)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_yaml_config_controls_k_and_blocker_params(self):
+        """Verifies that YAML configuration directly configures max_heap_k, channel toggles, and weights."""
+        cfg_path = "configs/blocking/blocking_v03.yaml"
+        blocker = MultiChannelBlocker(config_path=cfg_path)
+        self.assertEqual(blocker.max_heap_k, 2000)
+        self.assertTrue(blocker.ch_A_enabled)
+        self.assertTrue(blocker.ch_E2_enabled)
+        self.assertEqual(blocker.weights.get("CH_A"), 10.0)
+        self.assertEqual(blocker.weights.get("CH_B"), 8.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,0 +1,57 @@
+name: "EXP_003_memory_safe_ceiling"
+description: "Authoritative memory-safe candidate blocker ceiling and bounded ranked candidate evaluation (Mode A: true unbounded ceiling, Mode B: bounded evidence-ranked Top-K)."
+version: 3.0
+
+country_partitioning:
+  enabled: true
+  open_set: true
+
+channels:
+  channel_A_exact_name:
+    enabled: true
+    description: "Exact normalized and legal-stripped business name"
+  channel_B_compact_domain:
+    enabled: true
+    description: "Compact alphanumeric and domain-root representations"
+  channel_C2_candidate_df_rare_token:
+    enabled: true
+    description: "Candidate-population-aware rare distinctive name tokens"
+    min_token_len: 4
+    max_candidate_df: 5
+    max_tokens_per_entity: 2
+  channel_D2_address_rescue:
+    enabled: true
+    description: "True address-only rescue channels independent of business name"
+    exact_normalized: true
+    compact_normalized: true
+    building_and_street: true
+    postal_and_street: true
+    address_token_pair: true
+    address_token_max_candidate_df: 25
+    address_token_min_len: 4
+  channel_E2_symmetric_transliteration:
+    enabled: true
+    description: "Symmetric cross-script transliteration and transliterated token keys"
+    token_min_len: 3
+    max_candidate_df: 5
+  channel_F_order_invariant_name:
+    enabled: true
+    description: "Order-invariant rare token pairs from business name"
+    max_candidate_df: 25
+    max_pairs_per_entity: 3
+
+candidate_ranking:
+  enabled: true
+  channel_weights:
+    CH_A: 10.0
+    CH_B: 8.0
+    CH_C2: 5.0
+    CH_D2: 6.0
+    CH_E2: 7.0
+    CH_F: 5.0
+  multi_channel_bonus: 2.0
+  tie_break: "entity_id_asc"
+
+constraints:
+  max_heap_k: 2000
+  production_caps: [2000, 1000, 500, 250, 100]

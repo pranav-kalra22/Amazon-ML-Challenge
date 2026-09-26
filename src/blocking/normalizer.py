@@ -62,9 +62,9 @@ def normalize_name_non_destructive(raw_name: Any) -> Dict[str, Any]:
     else:
         raw_str = str(raw_name).strip()
         
-    if not raw_str:
+    if not raw_str or raw_str.lower() in {"", "nan", "<null>", "null", "none"}:
         return {
-            "raw": "",
+            "raw": raw_str if raw_name is not None and not (isinstance(raw_name, float) and str(raw_name) == "nan") else "",
             "norm_unicode": "",
             "punct_norm": "",
             "compact_alnum": "",
@@ -75,7 +75,10 @@ def normalize_name_non_destructive(raw_name: Any) -> Dict[str, Any]:
             "trans_stripped": "",
             "trans_compact": "",
             "tokens": [],
-            "distinctive_tokens": []
+            "distinctive_tokens": [],
+            "trans_tokens": [],
+            "trans_distinctive_tokens": [],
+            "sorted_token_signature": ""
         }
         
     is_asc = raw_str.isascii()

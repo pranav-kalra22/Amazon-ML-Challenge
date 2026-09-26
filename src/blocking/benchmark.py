@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Authoritative Blocking Benchmark Pipeline for Amazon ML Challenge 2026 — EXP_002.
+Authoritative Blocking Benchmark Pipeline for Amazon ML Challenge 2026 — EXP_003.
 
 Evaluates candidate-generation strategies on the canonical 50k validation split
 against the full ~10.32M training S2/S3 candidate population.
 
 Key Features:
-1. Loads configuration authoritatively from YAML (e.g., configs/blocking/blocking_v02.yaml).
-2. Continuous peak-RAM sampling via background psutil thread (initial, true peak, final RSS).
-3. Evaluates True Link Recall, Full Entity Coverage, Oracle Macro F0.5.
-4. Evaluates per-channel recall and incremental contribution across A, B, C2, D2, E2, F.
-5. Evaluates Top-K diagnostic candidate caps using deterministic evidence-ranked sorting.
-6. Measures US vs India, S2 vs S3, and missing-address link recall.
-7. Categorizes misses with measurable recoverability diagnostics, separating OBSERVATION from PROPOSED RECOVERY CHANNEL.
-8. Logs results honestly into experiments/experiment_log.csv with code_commit, results_commit, and git_dirty.
+1. Loads configuration authoritatively from YAML (e.g., configs/blocking/blocking_v03.yaml).
+2. Mode A: True Unbounded Ceiling Mode tracking ground truth hits with zero storage limits.
+3. Mode B: Ranked Production Candidate Mode with bounded Top-K evidence heaps (K=2000, 1000, 500, 250, 100).
+4. Continuous peak-RAM sampling via background psutil thread (initial, true peak, final RSS).
+5. Exact uncapped candidate volume accounting without memory explosion.
+6. EXP_002 Miss Reconsideration: classifies EXP_002 misses as STREAMING_CAP_MISS vs BLOCKING_RULE_MISS.
+7. Logs results honestly into experiments/experiment_log.csv with code_commit, results_commit, and git_dirty.
 """
 
 import os
@@ -93,14 +92,14 @@ def get_git_status() -> Tuple[str, bool]:
 
 
 def run_benchmark(
-    config_path: str = "configs/blocking/blocking_v02.yaml",
+    config_path: str = "configs/blocking/blocking_v03.yaml",
     val_split_path: str = "artifacts/splits/val_s1_ids_50k_seed42.parquet",
     s1_path: str = "dataset/train/train_source1.tsv",
     gt_path: str = "dataset/train/train_ground_truth.tsv",
     s2_path: str = "dataset/train/train_source2.tsv",
     s3_path: str = "dataset/train/train_source3.tsv",
     output_dir: str = "reports/blocking",
-    experiment_id: str = "EXP_002_corrected_lexical_blocker",
+    experiment_id: str = "EXP_003_memory_safe_ceiling",
     code_commit_override: Optional[str] = None
 ):
     mem_tracker = MemoryTracker(interval_sec=0.5)
@@ -153,6 +152,7 @@ def run_benchmark(
     # 4. Load Ground Truth for validation entities
     t0 = time.time()
     val_gt = {}
+    val_gt_pairs_by_s1_id = set()
     total_val_true_links = 0
     s2_true_links = 0
     s3_true_links = 0
@@ -168,6 +168,7 @@ def run_benchmark(
                         cand = x.strip()
                         if cand:
                             m_ids.add(cand)
+                            val_gt_pairs_by_s1_id.add((s1_id, cand))
                             if cand.startswith("S2-"):
                                 s2_true_links += 1
                             else:
@@ -186,11 +187,22 @@ def run_benchmark(
     idx_runtime = time.time() - t_idx_start
     print(f"Index built in {idx_runtime:.2f}s. Current observed peak RAM: {mem_tracker.peak_rss:.2f} MB", flush=True)
 
+    # Build numeric S1 index pairs for Mode A ground-truth hit tracking
+    val_gt_idx_pairs = {
+        (blocker.s1_id_to_idx[s1_id], cid)
+        for (s1_id, cid) in val_gt_pairs_by_s1_id
+    }
+
     # 6. Stream candidate population across full S2 and S3 files (Pass 2)
+    # Mode A (Ceiling Mode): tracks all val_gt_idx_pairs without any storage cap.
+    # Mode B (Bounded Heap Mode): retains top K candidates per entity in a bounded min-heap.
     t_retrieval_start = time.time()
+    max_k = config.get("constraints", {}).get("max_heap_k", 2000)
     candidates = blocker.generate_candidates_streaming(
         [s2_path, s3_path],
-        progress_interval=1000000
+        progress_interval=1000000,
+        max_heap_k=max_k,
+        gt_links_set=val_gt_idx_pairs
     )
     retrieval_runtime = time.time() - t_retrieval_start
     print(f"Retrieval complete in {retrieval_runtime:.2f}s. Current observed peak RAM: {mem_tracker.peak_rss:.2f} MB", flush=True)
@@ -199,144 +211,121 @@ def run_benchmark(
     t_eval_start = time.time()
     print("\nComputing comprehensive benchmark metrics...", flush=True)
 
-    # Per-entity candidate sets and channel sets
-    candidate_sets = {}
-    channel_candidates = {ch: defaultdict(set) for ch in ["A", "B", "C2", "D2", "E2", "F"]}
-    candidate_counts = []
-    ch_bits = {"A": CH_A, "B": CH_B, "C2": CH_C2, "D2": CH_D2, "E2": CH_E2, "F": CH_F}
+    # =========================================================================
+    # PART A: TRUE UNBOUNDED CANDIDATE CEILING METRICS (Mode A)
+    # =========================================================================
+    print("Evaluating Mode A: True Unbounded Blocking Ceiling...", flush=True)
 
-    for s1_idx, s1_id in enumerate(blocker.idx_to_s1_id):
-        cand_dict = candidates[s1_idx]
-        cand_set = set(cand_dict.keys())
-        candidate_sets[s1_id] = cand_set
-        candidate_counts.append(len(cand_set))
+    # True links hit in Mode A
+    mode_a_hit_pairs = set(candidates.gt_hits.keys())  # Set of (s1_idx, cand_id)
+    retrieved_true_links = len(mode_a_hit_pairs)
+    retrieved_s2_links = sum(1 for (_, cid) in mode_a_hit_pairs if cid.startswith("S2-"))
+    retrieved_s3_links = sum(1 for (_, cid) in mode_a_hit_pairs if cid.startswith("S3-"))
 
-        for cand_id, mask in cand_dict.items():
-            for ch, bit in ch_bits.items():
-                if mask & bit:
-                    channel_candidates[ch][s1_id].add(cand_id)
-
-    total_candidates = sum(candidate_counts)
-    cand_counts_arr = np.array(candidate_counts)
-
-    cand_stats = {
-        "mean": float(np.mean(cand_counts_arr)),
-        "median": float(np.median(cand_counts_arr)),
-        "p90": float(np.percentile(cand_counts_arr, 90)),
-        "p95": float(np.percentile(cand_counts_arr, 95)),
-        "p99": float(np.percentile(cand_counts_arr, 99)),
-        "max": int(np.max(cand_counts_arr)),
-        "min": int(np.min(cand_counts_arr))
-    }
-
-    # Total possible search space: S2 (5,034,616) + S3 (5,285,603) = 10,320,219
-    total_search_population = 10320219
-    total_brute_force_pairs = len(val_s1_id_set) * total_search_population
-    reduction_ratio = 1.0 - (total_candidates / total_brute_force_pairs)
-
-    # True Link Recall and Full Entity Coverage
-    retrieved_true_links = 0
-    retrieved_s2_links = 0
-    retrieved_s3_links = 0
-    retrieved_missing_addr_links = 0
-    total_missing_addr_true_links = 0
-    full_coverage_entities = 0
+    # Per-entity true links retrieved
+    mode_a_oracle_preds = {}
+    mode_a_full_cov_count = 0
     non_singleton_entities = 0
 
-    missed_links = []
-    oracle_predictions = {}
+    metadata_map = {rec["entity_id"]: {"country": rec["country"]} for rec in val_s1_records}
+    missed_true_links = []  # Mode A missed links
 
-    for s1_id, truth_set in val_gt.items():
-        cand_set = candidate_sets.get(s1_id, set())
-        tp_set = truth_set & cand_set
-        retrieved_true_links += len(tp_set)
-        oracle_predictions[s1_id] = tp_set
-
-        for m in tp_set:
-            if m.startswith("S2-"):
-                retrieved_s2_links += 1
-            else:
-                retrieved_s3_links += 1
-
+    for s1_idx, s1_id in enumerate(blocker.idx_to_s1_id):
+        truth_set = val_gt.get(s1_id, set())
         if len(truth_set) > 0:
             non_singleton_entities += 1
-            if truth_set.issubset(cand_set):
-                full_coverage_entities += 1
 
-            missed_set = truth_set - cand_set
-            for mid in missed_set:
-                missed_links.append((s1_id, mid))
+        hit_set = {cid for cid in truth_set if (s1_idx, cid) in mode_a_hit_pairs}
+        mode_a_oracle_preds[s1_id] = hit_set
 
-    link_recall = retrieved_true_links / total_val_true_links if total_val_true_links > 0 else 0.0
-    s2_recall = retrieved_s2_links / s2_true_links if s2_true_links > 0 else 0.0
-    s3_recall = retrieved_s3_links / s3_true_links if s3_true_links > 0 else 0.0
-    full_coverage_rate = full_coverage_entities / non_singleton_entities if non_singleton_entities > 0 else 0.0
+        if len(truth_set) > 0:
+            if truth_set.issubset(hit_set):
+                mode_a_full_cov_count += 1
+            for mid in (truth_set - hit_set):
+                missed_true_links.append((s1_id, mid))
 
-    # Calculate Oracle Macro F0.5
-    metadata_map = {rec["entity_id"]: {"country": rec["country"]} for rec in val_s1_records}
-    oracle_eval_results = evaluate_predictions(val_gt, oracle_predictions, metadata_map)
+    link_recall_unbounded = retrieved_true_links / total_val_true_links if total_val_true_links > 0 else 0.0
+    s2_recall_unbounded = retrieved_s2_links / s2_true_links if s2_true_links > 0 else 0.0
+    s3_recall_unbounded = retrieved_s3_links / s3_true_links if s3_true_links > 0 else 0.0
+    full_coverage_rate_unbounded = mode_a_full_cov_count / non_singleton_entities if non_singleton_entities > 0 else 0.0
 
-    # Per-Channel Recall & Incremental Contribution
-    print("Measuring per-channel performance and incremental links added...", flush=True)
+    oracle_eval_unbounded = evaluate_predictions(val_gt, mode_a_oracle_preds, metadata_map)
+
+    # Per-Channel Recall & Incremental Contribution in Mode A
+    channel_bits = [
+        ("A", CH_A, "Exact Normalized Name"),
+        ("B", CH_B, "Compact & Domain-Normalized"),
+        ("C2", CH_C2, "Candidate-DF-Aware Rare Token"),
+        ("D2", CH_D2, "True Address-Only Rescue"),
+        ("E2", CH_E2, "Symmetric Transliteration"),
+        ("F", CH_F, "Order-Invariant Token Pairs")
+    ]
+
     channel_metrics = []
-    accumulated_links = set()
+    accumulated_pairs = set()
 
-    for ch in ["A", "B", "C2", "D2", "E2", "F"]:
-        ch_cands = channel_candidates[ch]
-        ch_retrieved = 0
-        ch_cand_counts = [len(ch_cands.get(s1_id, set())) for s1_id in val_s1_id_set]
-        ch_avg_cands = float(np.mean(ch_cand_counts))
-
-        ch_links = set()
-        for s1_id, truth_set in val_gt.items():
-            hit_set = truth_set & ch_cands.get(s1_id, set())
-            ch_retrieved += len(hit_set)
-            for m in hit_set:
-                ch_links.add((s1_id, m))
-
+    for ch_name, bit, desc in channel_bits:
+        ch_pairs = {pair for pair, mask in candidates.gt_hits.items() if mask & bit}
+        ch_retrieved = len(ch_pairs)
         ch_recall = ch_retrieved / total_val_true_links if total_val_true_links > 0 else 0.0
-        unique_links_added = len(ch_links - accumulated_links)
-        accumulated_links.update(ch_links)
+        unique_links_added = len(ch_pairs - accumulated_pairs)
+        accumulated_pairs.update(ch_pairs)
+
+        # Average uncapped candidates generated per S1 on this channel
+        ch_counts = candidates.uncapped_channel_counts.get(bit, np.zeros(len(val_s1_records)))
+        ch_avg_cands = float(np.mean(ch_counts))
 
         channel_metrics.append({
-            "channel": ch,
-            "description": {
-                "A": "Exact Normalized Name",
-                "B": "Compact & Domain-Normalized",
-                "C2": "Candidate-DF-Aware Rare Token",
-                "D2": "True Address-Only Rescue",
-                "E2": "Symmetric Transliteration",
-                "F": "Order-Invariant Token Pairs"
-            }[ch],
-            "link_recall": ch_recall,
+            "channel": ch_name,
+            "description": desc,
+            "link_recall": round(ch_recall, 6),
             "true_links_retrieved": ch_retrieved,
             "unique_links_added": unique_links_added,
-            "avg_candidates": ch_avg_cands
+            "avg_candidates": round(ch_avg_cands, 2)
         })
 
-    # Diagnostic Candidate Caps Benchmark with DETERMINISTIC EVIDENCE RANKING
-    print("Benchmarking diagnostic candidate caps with deterministic evidence ranking...", flush=True)
-    diagnostic_caps = config.get("constraints", {}).get("diagnostic_caps", [None, 500, 250, 100, 50, 30])
+    # Exact Uncapped Candidate Statistics
+    uncapped_arr = candidates.uncapped_counts
+    total_uncapped_pairs = int(np.sum(uncapped_arr))
+    total_search_population = 10320219
+    total_brute_force_pairs = len(val_s1_id_set) * total_search_population
+    uncapped_reduction_ratio = 1.0 - (total_uncapped_pairs / total_brute_force_pairs)
+
+    uncapped_cand_stats = {
+        "mean": float(np.mean(uncapped_arr)),
+        "median": float(np.median(uncapped_arr)),
+        "p90": float(np.percentile(uncapped_arr, 90)),
+        "p95": float(np.percentile(uncapped_arr, 95)),
+        "p99": float(np.percentile(uncapped_arr, 99)),
+        "max": int(np.max(uncapped_arr)),
+        "min": int(np.min(uncapped_arr))
+    }
+
+    # =========================================================================
+    # PART B: RANKED PRODUCTION CANDIDATES BENCHMARK (Mode B)
+    # =========================================================================
+    print("Evaluating Mode B: Bounded Evidence-Ranked Candidate Heaps...", flush=True)
+    production_caps = config.get("constraints", {}).get("production_caps", [2000, 1000, 500, 250, 100])
     cap_results = []
 
-    # Pre-rank candidate lists for each entity
-    print("  Ranking candidates deterministically per entity...", flush=True)
-    ranked_candidates_per_entity = {}
-    for s1_idx, s1_id in enumerate(blocker.idx_to_s1_id):
-        cand_dict = candidates[s1_idx]
-        ranked_candidates_per_entity[s1_id] = blocker.rank_entity_candidates(cand_dict, cap=None)
+    # Sort each entity's heap deterministically once
+    print("  Deterministically ranking candidates from bounded heaps...", flush=True)
+    ranked_candidates_per_entity = [
+        blocker.rank_entity_candidates(candidates.heaps[s1_idx], cap=None)
+        for s1_idx in range(len(blocker.idx_to_s1_id))
+    ]
 
-    for cap in diagnostic_caps:
+    for cap in production_caps:
         cap_retrieved = 0
         cap_full_cov = 0
         cap_oracle_preds = {}
+        cap_cand_counts = []
 
-        for s1_id, truth_set in val_gt.items():
-            ranked_cands = ranked_candidates_per_entity.get(s1_id, [])
-            if cap is not None:
-                eff_cands = set(ranked_cands[:cap])
-            else:
-                eff_cands = set(ranked_cands)
+        for s1_idx, s1_id in enumerate(blocker.idx_to_s1_id):
+            truth_set = val_gt.get(s1_id, set())
+            ranked_list = ranked_candidates_per_entity[s1_idx]
+            eff_cands = set(ranked_list[:cap])
+            cap_cand_counts.append(len(eff_cands))
 
             tp = truth_set & eff_cands
             cap_retrieved += len(tp)
@@ -350,19 +339,57 @@ def run_benchmark(
         c_eval = evaluate_predictions(val_gt, cap_oracle_preds)
 
         cap_results.append({
-            "cap": "Uncapped" if cap is None else str(cap),
-            "link_recall": c_recall,
-            "full_entity_coverage": c_cov,
-            "oracle_macro_f05": c_eval["macro_f05"]
+            "k": cap,
+            "link_recall": round(c_recall, 6),
+            "full_entity_coverage": round(c_cov, 6),
+            "oracle_macro_f05": round(c_eval["macro_f05"], 6),
+            "mean_retained_candidates": round(float(np.mean(cap_cand_counts)), 2)
         })
 
-    eval_runtime = time.time() - t_eval_start
+    # =========================================================================
+    # PART C: RECONSIDER EXP_002 MISS ANALYSIS (Cap Impact Analysis)
+    # =========================================================================
+    print("Reconsidering EXP_002 miss analysis: distinguishing STREAMING_CAP_MISS vs BLOCKING_RULE_MISS...", flush=True)
+    exp002_miss_path = "reports/blocking/EXP_002_corrected_lexical_blocker_blocking_misses.csv"
+    cap_impact_summary = {
+        "exp002_total_misses": 0,
+        "streaming_cap_misses": 0,
+        "blocking_rule_misses": 0,
+        "streaming_cap_pct": 0.0,
+        "blocking_rule_pct": 0.0
+    }
 
-    # 8. Miss Analysis Export with Measurable Diagnostics
-    print(f"\nAnalyzing and categorizing {len(missed_links):,} missed true links...", flush=True)
+    if os.path.exists(exp002_miss_path):
+        exp002_df = pd.read_csv(exp002_miss_path)
+        exp002_total = len(exp002_df)
+        cap_misses = 0
+        rule_misses = 0
+
+        for _, row in exp002_df.iterrows():
+            s1_id = row["source1_entity_id"]
+            cand_id = row["matched_entity_id"]
+            s1_idx = blocker.s1_id_to_idx.get(s1_id)
+            if s1_idx is not None and (s1_idx, cand_id) in mode_a_hit_pairs:
+                cap_misses += 1
+            else:
+                rule_misses += 1
+
+        cap_impact_summary = {
+            "exp002_total_misses": exp002_total,
+            "streaming_cap_misses": cap_misses,
+            "blocking_rule_misses": rule_misses,
+            "streaming_cap_pct": round(cap_misses / exp002_total * 100, 2) if exp002_total > 0 else 0.0,
+            "blocking_rule_pct": round(rule_misses / exp002_total * 100, 2) if exp002_total > 0 else 0.0
+        }
+        print(f"  EXP_002 Miss Breakdown: {cap_misses:,} ({cap_impact_summary['streaming_cap_pct']}%) were STREAMING_CAP_MISS; {rule_misses:,} ({cap_impact_summary['blocking_rule_pct']}%) were BLOCKING_RULE_MISS.", flush=True)
+
+    # =========================================================================
+    # PART D: GENUINE MISS ANALYSIS (EXP_003 Mode A Ceiling Misses)
+    # =========================================================================
+    print(f"\nAnalyzing and categorizing {len(missed_true_links):,} genuine ceiling missed true links...", flush=True)
     t_miss_start = time.time()
 
-    miss_cand_ids = set(mid for _, mid in missed_links)
+    miss_cand_ids = set(mid for _, mid in missed_true_links)
     miss_cand_lookup = {}
     for cand_file in [s2_path, s3_path]:
         with open(cand_file, "r", encoding="utf-8") as f:
@@ -384,7 +411,7 @@ def run_benchmark(
     miss_rows = []
     miss_category_counts = defaultdict(int)
 
-    for s1_id, mid in missed_links:
+    for s1_id, mid in missed_true_links:
         s1_data = val_s1_lookup.get(s1_id, {})
         cand_data = miss_cand_lookup.get(mid, {})
         src = "S2" if mid.startswith("S2-") else "S3"
@@ -400,7 +427,6 @@ def run_benchmark(
         s1_a_norm = normalize_address_non_destructive(raw_s1_a)
         cand_a_norm = normalize_address_non_destructive(raw_cand_a)
 
-        # Measurable token overlaps
         s1_n_toks = set(s1_n_norm["tokens"])
         cand_n_toks = set(cand_n_norm["tokens"])
         name_jaccard = len(s1_n_toks & cand_n_toks) / len(s1_n_toks | cand_n_toks) if (s1_n_toks | cand_n_toks) else 0.0
@@ -412,8 +438,6 @@ def run_benchmark(
         trans_overlap = set(s1_n_norm["trans_tokens"]) & set(cand_n_norm["trans_tokens"])
 
         is_missing_addr = not raw_cand_a or raw_cand_a.lower() in {"", "nan", "<null>", "null", "none"}
-        if is_missing_addr:
-            total_missing_addr_true_links += 1
 
         # Heuristic miss category & Measurable recoverability
         if is_missing_addr:
@@ -458,16 +482,19 @@ def run_benchmark(
             "proposed_recovery_channel": rec_ch
         })
 
+    # Save miss analysis CSV (gitignored)
     miss_csv_path = os.path.join(output_dir, f"{experiment_id}_blocking_misses.csv")
     miss_df = pd.DataFrame(miss_rows)
     miss_df.to_csv(miss_csv_path, index=False)
     print(f"Exported {len(miss_df):,} misses to {miss_csv_path} in {time.time()-t_miss_start:.2f}s", flush=True)
 
-    # Stop memory tracker and compute peak RAM
+    eval_runtime = time.time() - t_eval_start
     init_rss, peak_rss, final_rss = mem_tracker.stop()
     total_runtime = time.time() - start_time
 
-    # 9. Compile Benchmark Summary Report
+    # =========================================================================
+    # PART E: COMPILE BENCHMARK SUMMARY REPORT
+    # =========================================================================
     summary = {
         "experiment_id": experiment_id,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -479,31 +506,29 @@ def run_benchmark(
         "total_validation_s1_entities": len(val_s1_id_set),
         "total_validation_true_links": total_val_true_links,
         "candidate_search_population": total_search_population,
-        "primary_metrics": {
-            "true_link_recall": round(link_recall, 6),
-            "full_entity_coverage": round(full_coverage_rate, 6),
-            "oracle_macro_f05": round(oracle_eval_results["macro_f05"], 6),
-            "oracle_macro_precision": round(oracle_eval_results["macro_precision"], 6),
-            "oracle_macro_recall": round(oracle_eval_results["macro_recall"], 6),
-            "total_candidate_pairs": total_candidates,
-            "reduction_ratio": round(reduction_ratio, 8)
-        },
-        "candidate_statistics": cand_stats,
-        "subgroup_metrics": {
-            "country_breakdown": oracle_eval_results.get("country_breakdown", {}),
-            "source_diagnostics": {
-                "S2": {"true_links": s2_true_links, "tp_links": retrieved_s2_links, "link_recall": round(s2_recall, 6)},
-                "S3": {"true_links": s3_true_links, "tp_links": retrieved_s3_links, "link_recall": round(s3_recall, 6)}
+        "mode_A_true_unbounded_ceiling": {
+            "true_link_recall": round(link_recall_unbounded, 6),
+            "full_entity_coverage": round(full_coverage_rate_unbounded, 6),
+            "oracle_macro_f05": round(oracle_eval_unbounded["macro_f05"], 6),
+            "oracle_macro_precision": round(oracle_eval_unbounded["macro_precision"], 6),
+            "oracle_macro_recall": round(oracle_eval_unbounded["macro_recall"], 6),
+            "total_candidate_pairs_uncapped": total_uncapped_pairs,
+            "reduction_ratio_uncapped": round(uncapped_reduction_ratio, 8),
+            "candidate_volume_distribution": uncapped_cand_stats,
+            "subgroups": {
+                "country_breakdown": oracle_eval_unbounded.get("country_breakdown", {}),
+                "source_diagnostics": {
+                    "S2": {"true_links": s2_true_links, "tp_links": retrieved_s2_links, "link_recall": round(s2_recall_unbounded, 6)},
+                    "S3": {"true_links": s3_true_links, "tp_links": retrieved_s3_links, "link_recall": round(s3_recall_unbounded, 6)}
+                }
             },
-            "missing_address_diagnostics": {
-                "total_missing_addr_links_in_misses": total_missing_addr_true_links
-            }
+            "per_channel_metrics": channel_metrics
         },
-        "per_channel_metrics": channel_metrics,
-        "diagnostic_caps_ranked": cap_results,
+        "mode_B_ranked_production_candidates": cap_results,
+        "exp002_cap_impact_analysis": cap_impact_summary,
         "miss_analysis": {
-            "total_missed_links": len(missed_links),
-            "miss_rate": round(len(missed_links) / total_val_true_links, 6) if total_val_true_links > 0 else 0.0,
+            "total_missed_links": len(missed_true_links),
+            "miss_rate": round(len(missed_true_links) / total_val_true_links, 6) if total_val_true_links > 0 else 0.0,
             "category_breakdown": dict(miss_category_counts),
             "miss_file": miss_csv_path
         },
@@ -534,67 +559,63 @@ def run_benchmark(
         f.write(f"**Candidate Search Space:** {total_search_population:,} Training S2 + S3 Records  \n")
         f.write(f"**Total Runtime:** {round(total_runtime, 2)}s | **Peak RAM:** {round(peak_rss, 2)} MB (Initial: {round(init_rss, 2)} MB, Final: {round(final_rss, 2)} MB)  \n\n")
 
-        f.write("## 1. Primary Ceiling Metrics `[VALIDATION MEASUREMENT]`\n\n")
-        f.write("| Metric | EXP_001 Baseline | EXP_002 Corrected | Delta | Target |\n")
+        f.write("## 1. True Unbounded Candidate Ceiling (Mode A) `[VALIDATION MEASUREMENT]`\n\n")
+        f.write("> **NOTE:** Measured with zero candidate storage caps or streaming truncations. Reflects true mathematical upper bound of the blocking rules.\n\n")
+        f.write("| Metric | EXP_001 Baseline | EXP_002 (Capped at 1500) | EXP_003 True Unbounded Ceiling | Delta vs EXP_001 | Target |\n")
+        f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
+        f.write(f"| **True Link Recall** | 83.390% | 57.566% | **{link_recall_unbounded*100:.3f}%** ({retrieved_true_links:,} / {total_val_true_links:,}) | **{'+' if link_recall_unbounded >= 0.8339 else ''}{(link_recall_unbounded - 0.8339)*100:.3f}%** | $\\ge 98.0\\%$ |\n")
+        f.write(f"| **Full Entity Coverage** | 62.030% | 29.696% | **{full_coverage_rate_unbounded*100:.3f}%** ({mode_a_full_cov_count:,} / {non_singleton_entities:,}) | **{'+' if full_coverage_rate_unbounded >= 0.6203 else ''}{(full_coverage_rate_unbounded - 0.6203)*100:.3f}%** | Highest possible |\n")
+        f.write(f"| **Oracle Macro $F_{{0.5}}$** | 0.925756 | 0.736050 | **{oracle_eval_unbounded['macro_f05']:.6f}** | **{'+' if oracle_eval_unbounded['macro_f05'] >= 0.925756 else ''}{oracle_eval_unbounded['macro_f05'] - 0.925756:.6f}** | $\\ge 0.985884$ |\n")
+        f.write(f"| **Mean Candidates/S1** | 502.39 | 464.58 | **{uncapped_cand_stats['mean']:.2f}** | {uncapped_cand_stats['mean'] - 502.39:+.2f} | Manageable volume |\n")
+        f.write(f"| **Total Candidate Pairs** | 25,119,679 | 23,228,850 | {total_uncapped_pairs:,} | {total_uncapped_pairs - 25119679:+,} | Scalable volume |\n")
+        f.write(f"| **Reduction Ratio** | 99.995132% | 99.995498% | **{uncapped_reduction_ratio*100:.6f}%** | — | $> 99.99\\%$ |\n\n")
+
+        f.write("## 2. Mode B — Ranked Production Candidates Benchmark `[VALIDATION MEASUREMENT]`\n\n")
+        f.write("> **NOTE:** Evaluated across deterministic Top-K candidate caps using multi-channel evidence ranking.\n\n")
+        f.write("| Top-K Cap | Link Recall | Full Entity Coverage | Oracle Macro $F_{0.5}$ | Mean Retained Candidates |\n")
         f.write("| :--- | :--- | :--- | :--- | :--- |\n")
-        f.write(f"| **True Link Recall** | 83.390% | **{link_recall*100:.3f}%** ({retrieved_true_links:,} / {total_val_true_links:,}) | **{'+' if link_recall >= 0.8339 else ''}{(link_recall - 0.8339)*100:.3f}%** | $\\ge 98.0\\%$ |\n")
-        f.write(f"| **Full Entity Coverage** | 62.030% | **{full_coverage_rate*100:.3f}%** ({full_coverage_entities:,} / {non_singleton_entities:,}) | **{'+' if full_coverage_rate >= 0.6203 else ''}{(full_coverage_rate - 0.6203)*100:.3f}%** | Highest possible |\n")
-        f.write(f"| **Oracle Macro $F_{{0.5}}$** | 0.925756 | **{oracle_eval_results['macro_f05']:.6f}** | **{'+' if oracle_eval_results['macro_f05'] >= 0.925756 else ''}{oracle_eval_results['macro_f05'] - 0.925756:.6f}** | $\\ge 0.985884$ |\n")
-        f.write(f"| **Mean Candidates/S1** | 502.39 | **{cand_stats['mean']:.2f}** | {cand_stats['mean'] - 502.39:+.2f} | Manageable volume |\n")
-        f.write(f"| **Total Candidate Pairs** | 25,119,679 | {total_candidates:,} | {total_candidates - 25119679:+,} | Scalable volume |\n")
-        f.write(f"| **Reduction Ratio** | 99.995132% | **{reduction_ratio*100:.6f}%** | — | $> 99.99\\%$ |\n\n")
+        for res in cap_results:
+            f.write(f"| `K = {res['k']}` | **{res['link_recall']*100:.3f}%** | {res['full_entity_coverage']*100:.3f}% | **{res['oracle_macro_f05']:.6f}** | {res['mean_retained_candidates']:.1f} |\n")
 
-        f.write("## 2. Candidate Volume Distribution per Entity\n\n")
-        f.write("| Statistic | Value |\n")
-        f.write("| :--- | :--- |\n")
-        f.write(f"| Mean | {cand_stats['mean']:.2f} |\n")
-        f.write(f"| Median (p50) | {cand_stats['median']:.1f} |\n")
-        f.write(f"| p90 | {cand_stats['p90']:.1f} |\n")
-        f.write(f"| p95 | {cand_stats['p95']:.1f} |\n")
-        f.write(f"| p99 | {cand_stats['p99']:.1f} |\n")
-        f.write(f"| Maximum | {cand_stats['max']:,} |\n\n")
+        f.write("\n## 3. EXP_002 Miss Reconsideration (Cap Impact Analysis)\n\n")
+        f.write(f"- **EXP_002 Reported Misses:** {cap_impact_summary['exp002_total_misses']:,}\n")
+        f.write(f"- **STREAMING_CAP_MISS:** {cap_impact_summary['streaming_cap_misses']:,} ({cap_impact_summary['streaming_cap_pct']}%) — true candidates matched blocker rules but were dropped by the 1,500 streaming cap.\n")
+        f.write(f"- **BLOCKING_RULE_MISS:** {cap_impact_summary['blocking_rule_misses']:,} ({cap_impact_summary['blocking_rule_pct']}%) — genuine failure of lexical blocking rules.\n\n")
 
-        f.write("## 3. Per-Channel Recall & Incremental Contribution\n\n")
+        f.write("## 4. Per-Channel Recall & Incremental Contribution (Mode A)\n\n")
         f.write("| Channel | Description | Link Recall | True Links Retrieved | Unique Links Added | Avg Candidates |\n")
         f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
         for ch in channel_metrics:
             f.write(f"| **{ch['channel']}** | {ch['description']} | {ch['link_recall']*100:.2f}% | {ch['true_links_retrieved']:,} | **+{ch['unique_links_added']:,}** | {ch['avg_candidates']:.1f} |\n")
-        f.write(f"| **UNION** | **Channels A + B + C2 + D2 + E2 + F** | **{link_recall*100:.3f}%** | **{retrieved_true_links:,}** | **{retrieved_true_links:,}** | **{cand_stats['mean']:.1f}** |\n\n")
+        f.write(f"| **UNION** | **Channels A + B + C2 + D2 + E2 + F** | **{link_recall_unbounded*100:.3f}%** | **{retrieved_true_links:,}** | **{retrieved_true_links:,}** | **{uncapped_cand_stats['mean']:.1f}** |\n\n")
 
-        f.write("## 4. Deterministic Top-K Candidate Caps Benchmark\n\n")
-        f.write("> **NOTE:** Candidates deterministically ranked by composite evidence score descending, entity ID ascending.\n\n")
-        f.write("| Top-K Cap | Link Recall | Full Entity Coverage | Oracle Macro $F_{0.5}$ |\n")
-        f.write("| :--- | :--- | :--- | :--- |\n")
-        for cap in cap_results:
-            f.write(f"| `Top {cap['cap']}` | {cap['link_recall']*100:.3f}% | {cap['full_entity_coverage']*100:.3f}% | **{cap['oracle_macro_f05']:.6f}** |\n")
+        f.write("## 5. Subgroup Diagnostics (Mode A)\n\n")
+        f.write("### Country Breakdown\n\n")
+        for c, st in oracle_eval_unbounded.get("country_breakdown", {}).items():
+            f.write(f"- **{c}** ({st['entity_count']:,} entities): Oracle Macro $F_{{0.5}} = {st['macro_f05']:.6f}$, Precision = {st['macro_precision']:.6f}, Recall = {st['macro_recall']:.6f}\n")
 
-        f.write("\n## 5. Miss Analysis Breakdown (Measurable Recoverability Diagnostics)\n\n")
-        f.write(f"- **Total Missed Links:** {len(missed_links):,} ({len(missed_links)/total_val_true_links*100:.3f}% miss rate)\n")
+        f.write("\n### Source Diagnostics\n\n")
+        f.write(f"- **Source 2 Links**: Retrieved = {retrieved_s2_links:,} / {s2_true_links:,} ({s2_recall_unbounded*100:.2f}% recall)\n")
+        f.write(f"- **Source 3 Links**: Retrieved = {retrieved_s3_links:,} / {s3_true_links:,} ({s3_recall_unbounded*100:.2f}% recall)\n\n")
+
+        f.write("## 6. Genuine Ceiling Miss Analysis\n\n")
+        f.write(f"- **Total Missed Links:** {len(missed_true_links):,} ({len(missed_true_links)/total_val_true_links*100:.3f}% miss rate)\n")
         f.write(f"- **Miss Analysis CSV:** `{miss_csv_path}`\n\n")
         f.write("| Heuristic Miss Category | Count | Percentage | Primary Observation | Proposed Recovery Channel |\n")
         f.write("| :--- | :--- | :--- | :--- | :--- |\n")
         for cat, cnt in sorted(miss_category_counts.items(), key=lambda x: x[1], reverse=True):
-            f.write(f"| `{cat}` | {cnt:,} | {cnt/len(missed_links)*100:.2f}% | Measured in CSV | See recoverability analysis |\n")
-
-        f.write("\n## 6. Subgroup Diagnostics\n\n")
-        f.write("### Country Breakdown\n\n")
-        for c, st in oracle_eval_results.get("country_breakdown", {}).items():
-            f.write(f"- **{c}** ({st['entity_count']:,} entities): Oracle Macro $F_{{0.5}} = {st['macro_f05']:.6f}$, Precision = {st['macro_precision']:.6f}, Recall = {st['macro_recall']:.6f}\n")
-
-        f.write("\n### Source Diagnostics\n\n")
-        f.write(f"- **Source 2 Links**: Retrieved = {retrieved_s2_links:,} / {s2_true_links:,} ({s2_recall*100:.2f}% recall)\n")
-        f.write(f"- **Source 3 Links**: Retrieved = {retrieved_s3_links:,} / {s3_true_links:,} ({s3_recall*100:.2f}% recall)\n")
+            f.write(f"| `{cat}` | {cnt:,} | {cnt/len(missed_true_links)*100:.2f}% | Measured in CSV | See recoverability analysis |\n")
 
     print(f"\n[VALIDATION MEASUREMENT] Benchmark Complete!")
-    print(f"  True Link Recall:     {link_recall*100:.3f}% ({retrieved_true_links:,} / {total_val_true_links:,})")
-    print(f"  Full Entity Coverage: {full_coverage_rate*100:.3f}% ({full_coverage_entities:,} / {non_singleton_entities:,})")
-    print(f"  Oracle Macro F0.5:    {oracle_eval_results['macro_f05']:.6f}")
-    print(f"  Mean Candidates:      {cand_stats['mean']:.2f} (Median: {cand_stats['median']:.1f}, Max: {cand_stats['max']:,})")
-    print(f"  Total Candidates:     {total_candidates:,}")
-    print(f"  Observed Peak RAM:    {peak_rss:.2f} MB")
-    print(f"  Reports Saved To:     {md_path}")
+    print(f"  Mode A True Link Recall:     {link_recall_unbounded*100:.3f}% ({retrieved_true_links:,} / {total_val_true_links:,})")
+    print(f"  Mode A Full Entity Coverage: {full_coverage_rate_unbounded*100:.3f}% ({mode_a_full_cov_count:,} / {non_singleton_entities:,})")
+    print(f"  Mode A Oracle Macro F0.5:    {oracle_eval_unbounded['macro_f05']:.6f}")
+    print(f"  Uncapped Mean Candidates:    {uncapped_cand_stats['mean']:.2f} (Median: {uncapped_cand_stats['median']:.1f}, Max: {uncapped_cand_stats['max']:,})")
+    print(f"  Total Uncapped Candidates:   {total_uncapped_pairs:,}")
+    print(f"  Observed Peak RAM:           {peak_rss:.2f} MB")
+    print(f"  Reports Saved To:            {md_path}")
 
-    # 10. Register into experiments/experiment_log.csv
+    # Register into experiments/experiment_log.csv
     log_path = "experiments/experiment_log.csv"
     if os.path.exists(log_path):
         exp_row = {
@@ -602,7 +623,7 @@ def run_benchmark(
             "owner": "team",
             "status": "COMPLETED",
             "branch": "phase2/blocking-baseline",
-            "hypothesis": "Corrected multi-channel blocker (candidate-DF rare tokens, address-only rescue, symmetric transliteration, order-invariant pairs) elevates recall ceiling with deterministic evidence ranking.",
+            "hypothesis": "True unbounded blocking ceiling removes streaming cap bias, revealing true recall upper bound and bounded Top-K candidate performance.",
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time)),
             "completed_at": summary["timestamp"],
             "git_commit": code_commit,
@@ -617,20 +638,21 @@ def run_benchmark(
             "hyperparameters": json.dumps({
                 "channels": ["A", "B", "C2", "D2", "E2", "F"],
                 "candidate_df_max": config.get("channels", {}).get("channel_C2_candidate_df_rare_token", {}).get("max_candidate_df", 5),
-                "ranking_weights": config.get("candidate_ranking", {}).get("channel_weights", {})
+                "ranking_weights": config.get("candidate_ranking", {}).get("channel_weights", {}),
+                "max_heap_k": max_k
             }),
             "threshold_config": "{}",
-            "candidate_recall": round(link_recall, 6),
-            "full_entity_coverage": round(full_coverage_rate, 6),
-            "oracle_f05": round(oracle_eval_results["macro_f05"], 6),
+            "candidate_recall": round(link_recall_unbounded, 6),
+            "full_entity_coverage": round(full_coverage_rate_unbounded, 6),
+            "oracle_f05": round(oracle_eval_unbounded["macro_f05"], 6),
             "validation_macro_f05": 0.0,
             "singleton_accuracy": 1.0,
-            "precision": round(oracle_eval_results["macro_precision"], 6),
-            "recall": round(oracle_eval_results["macro_recall"], 6),
+            "precision": round(oracle_eval_unbounded["macro_precision"], 6),
+            "recall": round(oracle_eval_unbounded["macro_recall"], 6),
             "runtime_sec": round(total_runtime, 2),
             "memory_peak_mb": round(peak_rss, 2),
             "is_current_best": False,
-            "notes": f"EXP_002 Blocker. True-link recall: {link_recall*100:.2f}%, Oracle F0.5: {oracle_eval_results['macro_f05']:.4f}, Mean cands: {cand_stats['mean']:.1f}, Peak RAM: {peak_rss:.1f}MB.",
+            "notes": f"EXP_003 True Ceiling Blocker. Mode A Recall: {link_recall_unbounded*100:.2f}%, Oracle F0.5: {oracle_eval_unbounded['macro_f05']:.4f}, Mean cands: {uncapped_cand_stats['mean']:.1f}, Peak RAM: {peak_rss:.1f}MB.",
             "artifact_paths": f"{md_path};{miss_csv_path};{json_path}"
         }
 
@@ -647,8 +669,8 @@ def run_benchmark(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Blocking Benchmark")
-    parser.add_argument("--config", type=str, default="configs/blocking/blocking_v02.yaml", help="Path to blocker YAML config")
-    parser.add_argument("--experiment-id", type=str, default="EXP_002_corrected_lexical_blocker", help="Experiment ID")
+    parser.add_argument("--config", type=str, default="configs/blocking/blocking_v03.yaml", help="Path to blocker YAML config")
+    parser.add_argument("--experiment-id", type=str, default="EXP_003_memory_safe_ceiling", help="Experiment ID")
     parser.add_argument("--code-commit", type=str, default=None, help="Explicit code commit SHA")
     args = parser.parse_args()
 
