@@ -30,6 +30,8 @@ env/
 /temp/
 artifacts/cache/
 experiments/tmp/
+reports/blocking/*_blocking_misses.csv
+*.duckdb*
 
 # Logs
 *.log

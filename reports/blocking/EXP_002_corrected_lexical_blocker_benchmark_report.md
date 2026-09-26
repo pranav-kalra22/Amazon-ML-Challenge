@@ -1,13 +1,16 @@
 # Candidate Generation Benchmark Report — `EXP_002_corrected_lexical_blocker`
+> **Classification:** `[CAP_AFFECTED_MEASUREMENT]`  
+> **Note:** Candidate admission in EXP_002 was capped by `max_streaming_candidates_per_entity = 1500` during streaming before candidate evidence ranking. This report reflects a capped candidate measurement, NOT an unbounded candidate recall ceiling.
 
 **Date:** 2026-09-25T16:14:31Z  
 **Validation Split:** `val_50k_seed42` (50,000 Source 1 Entities)  
 **Code Commit:** `5af2d35` (git_dirty: `False`)  
+**Results Commit:** `44c7eb8`  
 **Authoritative Config:** `configs/blocking/blocking_v02.yaml`  
 **Candidate Search Space:** 10,320,219 Training S2 + S3 Records  
 **Total Runtime:** 1283.01s | **Peak RAM:** 4629.47 MB (Initial: 84.35 MB, Final: 4629.47 MB)  
 
-## 1. Primary Ceiling Metrics `[VALIDATION MEASUREMENT]`
+## 1. Primary Metrics `[CAP_AFFECTED_MEASUREMENT]`
 
 | Metric | EXP_001 Baseline | EXP_002 Corrected | Delta | Target |
 | :--- | :--- | :--- | :--- | :--- |
