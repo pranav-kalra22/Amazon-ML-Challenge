@@ -24,6 +24,7 @@ import time
 import json
 import yaml
 import psutil
+import heapq
 import argparse
 import subprocess
 import numpy as np
@@ -324,9 +325,10 @@ def run_cloud_benchmark(
     # 4. Canonical Lexical Blocker: Pass 1 Candidate-DF Scanning & Query Index
     t_idx_start = time.time()
     blocker = MultiChannelBlocker(config=config)
+    cand_paths_pass1 = None if mode.endswith("smoke") else [s2_path, s3_path]
     blocker.build_query_index(
         val_s1_records,
-        candidate_file_paths=[s2_path, s3_path]
+        candidate_file_paths=cand_paths_pass1
     )
     print(f"Authoritative query index built in {time.time()-t_idx_start:.2f}s. Peak RAM: {mem_tracker.peak_rss:.2f} MB", flush=True)
 
@@ -374,49 +376,88 @@ def run_cloud_benchmark(
     # =========================================================================
     # PARTITION-AT-A-TIME EXECUTION ARCHITECTURE (Item 5)
     # =========================================================================
-    for country in all_countries:
-        s1_country_recs, s1_country_idxs = s1_by_country[country]
-        if not s1_country_recs:
-            continue
-
-        for src_name, src_path in candidate_sources:
-            t_part_start = time.time()
-            print(f"\n>>> Processing Partition: Country='{country}' x Source='{src_name}' from {src_path}...", flush=True)
-
-            partition_candidate_records: List[Dict[str, Any]] = []
-            rows_scanned_in_partition = 0
-
-            with open(src_path, "r", encoding="utf-8") as f:
-                header = f.readline().rstrip("\n").split("\t")
-                col_id = header.index("entity_id") if "entity_id" in header else 0
-                col_name = header.index("business_name") if "business_name" in header else 1
-                col_addr = header.index("business_address") if "business_address" in header else 2
-                col_country = header.index("country") if "country" in header else 3
-
-                for line in f:
-                    parts = line.rstrip("\n").split("\t")
-                    if len(parts) <= col_country:
-                        continue
-                    row_c = parts[col_country]
-
-                    cand_id = parts[col_id]
-                    raw_name = parts[col_name]
-                    raw_addr = parts[col_addr]
-
-                    # Filter for this partition
-                    if row_c != country:
-                        # In positive_smoke mode, allow true matches even if country has noise
-                        if not (mode == "positive_smoke" and cand_id in target_true_cand_ids):
+    if is_parity:
+        print("\n>>> Lexical Parity Gate: Running canonical MultiChannelBlocker streaming across S2 and S3...", flush=True)
+        res = blocker.generate_candidates_streaming(
+            candidate_file_paths=[s2_path, s3_path],
+            max_heap_k=max_k,
+            gt_links_set=val_gt_idx_pairs
+        )
+        candidate_dicts = res
+        gt_hits = res.gt_hits
+        heaps = res.heaps
+        uncapped_counts = res.uncapped_counts
+        uncapped_channel_counts = res.uncapped_channel_counts
+        total_scanned_rows = res.total_scanned
+        lexical_hit_pairs = set(res.gt_hits.keys())
+    else:
+        smoke_corpus: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+        if mode == "positive_smoke":
+            print(f"Pre-extracting positive smoke candidate corpus ({len(target_true_cand_ids)} true candidates + distractors)...", flush=True)
+            for src_name, src_path in [("S2", s2_path), ("S3", s3_path)]:
+                distractor_count = 0
+                with open(src_path, "r", encoding="utf-8") as f:
+                    header = f.readline().rstrip("\n").split("\t")
+                    col_id = header.index("entity_id") if "entity_id" in header else 0
+                    col_name = header.index("business_name") if "business_name" in header else 1
+                    col_addr = header.index("business_address") if "business_address" in header else 2
+                    col_country = header.index("country") if "country" in header else 3
+                    for line in f:
+                        parts = line.rstrip("\n").split("\t")
+                        if len(parts) <= col_country:
                             continue
+                        cid = parts[col_id]
+                        c = parts[col_country]
+                        if cid in target_true_cand_ids:
+                            smoke_corpus[(c, src_name)].append({
+                                "entity_id": cid, "business_name": parts[col_name],
+                                "business_address": parts[col_addr], "country": c
+                            })
+                        elif distractor_count < 2500:
+                            distractor_count += 1
+                            smoke_corpus[(c, src_name)].append({
+                                "entity_id": cid, "business_name": parts[col_name],
+                                "business_address": parts[col_addr], "country": c
+                            })
+            print(f"Positive smoke corpus prepared with {sum(len(v) for v in smoke_corpus.values()):,} total candidates.", flush=True)
 
-                    # Filtering for smoke tests
-                    if mode == "plumbing_smoke":
-                        if rows_scanned_in_partition >= smoke_cand_count:
-                            break
-                    elif mode == "positive_smoke":
-                        is_target = cand_id in target_true_cand_ids
-                        if not is_target and rows_scanned_in_partition >= 5000:
-                            continue
+        for country in all_countries:
+            s1_country_recs, s1_country_idxs = s1_by_country[country]
+            if not s1_country_recs:
+                continue
+
+            for src_name, src_path in candidate_sources:
+                t_part_start = time.time()
+                print(f"\n>>> Processing Partition: Country='{country}' x Source='{src_name}' from {src_path}...", flush=True)
+
+                partition_candidate_records: List[Dict[str, Any]] = []
+                rows_scanned_in_partition = 0
+
+                if mode == "positive_smoke":
+                    cand_stream = smoke_corpus.get((country, src_name), [])
+                    cand_iter = (
+                        (r["entity_id"], r["business_name"], r["business_address"], r["country"])
+                        for r in cand_stream
+                    )
+                else:
+                    def _gen_file_cands():
+                        with open(src_path, "r", encoding="utf-8") as f:
+                            header = f.readline().rstrip("\n").split("\t")
+                            col_id = header.index("entity_id") if "entity_id" in header else 0
+                            col_name = header.index("business_name") if "business_name" in header else 1
+                            col_addr = header.index("business_address") if "business_address" in header else 2
+                            col_country = header.index("country") if "country" in header else 3
+                            for line in f:
+                                parts = line.rstrip("\n").split("\t")
+                                if len(parts) <= col_country:
+                                    continue
+                                if parts[col_country] == country:
+                                    yield (parts[col_id], parts[col_name], parts[col_addr], parts[col_country])
+                    cand_iter = _gen_file_cands()
+
+                for cand_id, raw_name, raw_addr, row_c in cand_iter:
+                    if mode == "plumbing_smoke" and rows_scanned_in_partition >= smoke_cand_count:
+                        break
 
                     rows_scanned_in_partition += 1
                     total_scanned_rows += 1
@@ -439,14 +480,25 @@ def run_cloud_benchmark(
                                 gt_hits[(s1_idx, cand_id)] = gt_hits.get((s1_idx, cand_id), 0) | bitmask
                                 lexical_hit_pairs.add((s1_idx, cand_id))
 
-                            # Evidence-ranked heap
+                            # Evidence-ranked heap with deduplication
                             score = blocker.compute_candidate_evidence_score(bitmask)
                             item = CandidateHeapItem(score, cand_id, bitmask)
                             h = heaps[s1_idx]
-                            if len(h) < max_k:
-                                heapq.heappush(h, item)
-                            elif item > h[0]:
-                                heapq.heapreplace(h, item)
+                            found = False
+                            for h_elem in h:
+                                if h_elem.cand_id == cand_id:
+                                    if score > h_elem.score:
+                                        h_elem.score = score
+                                        h_elem.bitmask = bitmask
+                                    found = True
+                                    break
+                            if found:
+                                heapq.heapify(h)
+                            else:
+                                if len(h) < max_k:
+                                    heapq.heappush(h, item)
+                                elif item > h[0]:
+                                    heapq.heapreplace(h, item)
 
                     # Collect candidate record for TF-IDF if enabled
                     if tfidf_active:
@@ -670,12 +722,16 @@ def run_cloud_benchmark(
         }
 
     # Save summary files
-    mode_suffix = "lexical_parity" if is_parity else mode
-    summary_path = os.path.join(output_dir, f"{experiment_id}_{mode_suffix}_summary.json")
+    if is_parity:
+        summary_path = os.path.join(output_dir, "EXP_004_lexical_parity_summary.json")
+        report_path = os.path.join(output_dir, "EXP_004_lexical_parity_report.md")
+    else:
+        summary_path = os.path.join(output_dir, f"{experiment_id}_{mode}_summary.json")
+        report_path = os.path.join(output_dir, f"{experiment_id}_{mode}_report.md")
+
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    report_path = os.path.join(output_dir, f"{experiment_id}_{mode_suffix}_report.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(f"# Blocking Benchmark Report: {experiment_id} [{tag_prefix}]\n\n")
         f.write(f"- **Mode**: `{mode}`\n")
