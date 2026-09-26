@@ -1,0 +1,16 @@
+{
+  "split_id": "holdout_50k_seed2026",
+  "seed": 2026,
+  "total_source1_entities": 2206821,
+  "holdout_size": 50000,
+  "dev_val_size": 50000,
+  "remaining_train_pool_size": 2106821,
+  "holdout_singletons": 2792,
+  "holdout_singleton_rate": 0.05584,
+  "holdout_country_distribution": {
+    "US": 29990,
+    "India": 20010
+  },
+  "dev_overlap_count": 0,
+  "holdout_file": "artifacts/splits\\holdout_s1_ids_50k_seed2026.parquet"
+}

@@ -24,4 +24,5 @@ keys:
     engine: "text_unidecode"
 
 constraints:
-  max_candidates_per_entity: 30
+  max_candidates_per_entity: null  # Explicitly uncapped for initial recall ceiling benchmark
+  diagnostic_caps: [null, 200, 100, 50, 30]

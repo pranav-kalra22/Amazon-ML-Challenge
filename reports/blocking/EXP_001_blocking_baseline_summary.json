@@ -1,0 +1,153 @@
+{
+  "experiment_id": "EXP_001_blocking_baseline",
+  "timestamp": "2026-09-25T14:05:18Z",
+  "validation_split": "val_50k_seed42",
+  "total_validation_s1_entities": 50000,
+  "total_validation_true_links": 172729,
+  "candidate_search_population": 10320219,
+  "primary_metrics": {
+    "true_link_recall": 0.833902,
+    "full_entity_coverage": 0.620297,
+    "oracle_macro_f05": 0.925756,
+    "oracle_macro_precision": 0.96826,
+    "oracle_macro_recall": 0.842592,
+    "total_candidate_pairs": 25119441,
+    "reduction_ratio": 0.99995132
+  },
+  "candidate_statistics": {
+    "mean": 502.38882,
+    "median": 87.0,
+    "p90": 877.0,
+    "p95": 1879.2499999999782,
+    "p99": 7956.030000000006,
+    "max": 28234,
+    "min": 0
+  },
+  "subgroup_metrics": {
+    "country_breakdown": {
+      "US": {
+        "entity_count": 29990,
+        "macro_f05": 0.9598545149547925,
+        "macro_precision": 0.9881960653551184,
+        "macro_recall": 0.8965193556582353,
+        "singleton_accuracy": 1.0
+      },
+      "India": {
+        "entity_count": 20010,
+        "macro_f05": 0.874651210127387,
+        "macro_precision": 0.9383808095952024,
+        "macro_recall": 0.761769135273633,
+        "singleton_accuracy": 1.0
+      }
+    },
+    "source_diagnostics": {
+      "S2": {
+        "true_links": 83561,
+        "predicted_links": 69190,
+        "tp_links": 69190,
+        "link_precision": 1.0,
+        "link_recall": 0.8280178552195402
+      },
+      "S3": {
+        "true_links": 89168,
+        "predicted_links": 74849,
+        "tp_links": 74849,
+        "link_precision": 1.0,
+        "link_recall": 0.8394154853759196
+      }
+    }
+  },
+  "per_channel_metrics": [
+    {
+      "channel": "A",
+      "description": "Exact Normalized Name",
+      "link_recall": 0.4597780337986094,
+      "true_links_retrieved": 79417,
+      "unique_links_added": 79417,
+      "avg_candidates": 80.65968
+    },
+    {
+      "channel": "B",
+      "description": "Compact & Domain-Normalized",
+      "link_recall": 0.4879898569435358,
+      "true_links_retrieved": 84290,
+      "unique_links_added": 5617,
+      "avg_candidates": 80.54998
+    },
+    {
+      "channel": "C",
+      "description": "Rare Token Inverted Index",
+      "link_recall": 0.2766240758645045,
+      "true_links_retrieved": 47781,
+      "unique_links_added": 20849,
+      "avg_candidates": 54.27402
+    },
+    {
+      "channel": "D",
+      "description": "Address Anchors",
+      "link_recall": 0.6096139038609614,
+      "true_links_retrieved": 105298,
+      "unique_links_added": 38156,
+      "avg_candidates": 367.17094
+    },
+    {
+      "channel": "E",
+      "description": "Transliteration Lexical",
+      "link_recall": 0.0,
+      "true_links_retrieved": 0,
+      "unique_links_added": 0,
+      "avg_candidates": 0.0
+    }
+  ],
+  "diagnostic_caps": [
+    {
+      "cap": "Uncapped",
+      "link_recall": 0.8339016609833901,
+      "full_entity_coverage": 0.6202974072191154,
+      "oracle_macro_f05": 0.925756152362865
+    },
+    {
+      "cap": "200",
+      "link_recall": 0.6914299278059851,
+      "full_entity_coverage": 0.4712972377563125,
+      "oracle_macro_f05": 0.8094036567347191
+    },
+    {
+      "cap": "100",
+      "link_recall": 0.5922051305802731,
+      "full_entity_coverage": 0.3618242670733774,
+      "oracle_macro_f05": 0.7309593679303945
+    },
+    {
+      "cap": "50",
+      "link_recall": 0.4818588656218701,
+      "full_entity_coverage": 0.27514404338247755,
+      "oracle_macro_f05": 0.6299723857602124
+    },
+    {
+      "cap": "30",
+      "link_recall": 0.40579173155636866,
+      "full_entity_coverage": 0.2233307913912896,
+      "oracle_macro_f05": 0.5509701158286938
+    }
+  ],
+  "miss_analysis": {
+    "total_missed_links": 28690,
+    "miss_rate": 0.166098,
+    "category_breakdown": {
+      "reordered_tokens_or_stopwords": 11744,
+      "missing_address": 2191,
+      "transliteration": 10826,
+      "severe_typo_or_dba": 3904,
+      "other": 25
+    },
+    "miss_file": "reports/blocking\\EXP_001_blocking_baseline_blocking_misses.csv"
+  },
+  "performance_profile": {
+    "index_runtime_sec": 1.83,
+    "retrieval_runtime_sec": 280.28,
+    "evaluation_runtime_sec": 64.12,
+    "total_runtime_sec": 348.23,
+    "peak_memory_mb": 3733.05
+  }
+}
