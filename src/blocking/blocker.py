@@ -64,12 +64,19 @@ class CandidateHeapItem:
     1. Lower evidence scores first.
     2. For equal scores, lexicographically LARGER candidate IDs first (so smaller IDs are kept).
     """
-    __slots__ = ("score", "cand_id", "bitmask")
+    __slots__ = ("score", "cand_id", "bitmask", "similarities")
 
-    def __init__(self, score: float, cand_id: str, bitmask: int):
+    def __init__(
+        self,
+        score: float,
+        cand_id: str,
+        bitmask: int,
+        similarities: Optional[Dict[str, float]] = None
+    ):
         self.score = score
         self.cand_id = cand_id
         self.bitmask = bitmask
+        self.similarities = similarities or {}
 
     def __lt__(self, other: "CandidateHeapItem") -> bool:
         if self.score != other.score:
@@ -95,7 +102,8 @@ class StreamingCandidateResult(list):
     """
     Subclasses list so candidates[s1_idx] returns {cand_id: bitmask}
     maintaining 100% backward compatibility with all existing tests and scripts,
-    while also exposing Mode A ceiling gt_hits, bounded heaps, and uncapped counts.
+    while also exposing Mode A ceiling gt_hits, bounded heaps, uncapped counts,
+    and cosine similarities metadata (self.similarities[s1_idx][cand_id]).
     """
     def __init__(
         self,
@@ -104,7 +112,8 @@ class StreamingCandidateResult(list):
         gt_hits: Optional[Dict[Tuple[int, str], int]] = None,
         uncapped_counts: Optional[np.ndarray] = None,
         uncapped_channel_counts: Optional[Dict[int, np.ndarray]] = None,
-        total_scanned: int = 0
+        total_scanned: int = 0,
+        similarities: Optional[List[Dict[str, Dict[str, float]]]] = None
     ):
         super().__init__(candidate_dicts)
         self.heaps = heaps if heaps is not None else []
@@ -112,6 +121,7 @@ class StreamingCandidateResult(list):
         self.uncapped_counts = uncapped_counts
         self.uncapped_channel_counts = uncapped_channel_counts if uncapped_channel_counts is not None else {}
         self.total_scanned = total_scanned
+        self.similarities = similarities if similarities is not None else [{} for _ in range(len(candidate_dicts))]
 
 
 class MultiChannelBlocker:
@@ -472,9 +482,109 @@ class MultiChannelBlocker:
                             if pairs_indexed >= self.f_max_pairs:
                                 break
 
-        print(f"\n[QUERY INDEX BUILT] in {time.time()-t0:.2f}s across {len(self.query_index):,} total keys:", flush=True)
-        for bit, ch_name in CHANNEL_NAMES.items():
-            print(f"  Channel {ch_name:2s}: {ch_counts[bit]:,} keys", flush=True)
+    def match_candidate_record(
+        self,
+        country: str,
+        raw_name: Any,
+        raw_addr: Any
+    ) -> Dict[int, int]:
+        """
+        Authoritative matching of a single candidate record against the multi-channel query index.
+        Evaluates Channels A, B, C2, D2, E2, F and returns a dictionary: {s1_idx: combined_bitmask}.
+        This is the single canonical candidate-side key generation and index lookup implementation.
+        """
+        c = country
+        n = normalize_name_non_destructive(raw_name)
+        row_s1_matches: Dict[int, int] = {}
+
+        # Channel A: Exact Normalized Name (Bit 1)
+        if self.ch_A_enabled:
+            if n["legal_stripped"]:
+                for s1_idx in self.query_index.get((CH_A, c, n["legal_stripped"]), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_A
+            if n["punct_norm"] and n["punct_norm"] != n["legal_stripped"]:
+                for s1_idx in self.query_index.get((CH_A, c, n["punct_norm"]), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_A
+
+        # Channel B: Compact & Domain (Bit 2)
+        if self.ch_B_enabled:
+            if len(n["compact_alnum"]) >= 4:
+                for s1_idx in self.query_index.get((CH_B, c, n["compact_alnum"]), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
+            if len(n["legal_stripped_compact"]) >= 4 and n["legal_stripped_compact"] != n["compact_alnum"]:
+                for s1_idx in self.query_index.get((CH_B, c, n["legal_stripped_compact"]), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
+            if n["domain_root"] and len(n["domain_root"]) >= 4:
+                for s1_idx in self.query_index.get((CH_B, c, n["domain_root"]), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
+
+        # Channel C2: Candidate-DF Rare Token (Bit 4)
+        if self.ch_C2_enabled:
+            for tok in n["distinctive_tokens"]:
+                if len(tok) >= self.c2_min_len:
+                    for s1_idx in self.query_index.get((CH_C2, c, tok), []):
+                        row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_C2
+
+        # Channel D2: True Address-Only Rescue (Bit 8)
+        if self.ch_D2_enabled and raw_addr and str(raw_addr).lower() not in {"", "nan", "<null>", "null", "none"}:
+            a = normalize_address_non_destructive(raw_addr)
+            # Exact & compact
+            if self.d2_exact and len(a["norm_unicode"]) >= 12:
+                for s1_idx in self.query_index.get((CH_D2, c, f"exact_{a['norm_unicode']}"), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
+            if self.d2_compact and len(a["compact_norm"]) >= 15:
+                for s1_idx in self.query_index.get((CH_D2, c, f"compact_{a['compact_norm']}"), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
+
+            # Building + Postal
+            if a["building_numeric"] and a["postal_code"]:
+                for s1_idx in self.query_index.get((CH_D2, c, f"bp_{a['building_numeric']}_{a['postal_code']}"), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
+
+            # Building + street
+            if self.d2_bldg_street and a["building_numeric"]:
+                for st in a["street_tokens"][:2]:
+                    for s1_idx in self.query_index.get((CH_D2, c, f"bs_{a['building_numeric']}_{st}"), []):
+                        row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
+
+            # Postal + street
+            if self.d2_postal_street and a["postal_code"]:
+                for st in a["street_tokens"][:2]:
+                    for s1_idx in self.query_index.get((CH_D2, c, f"ps_{a['postal_code']}_{st}"), []):
+                        row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
+
+            # Address token pairs
+            if self.d2_addr_pair and len(a["distinctive_tokens"]) >= 2:
+                dtoks_a = a["distinctive_tokens"][:4]
+                for i in range(len(dtoks_a)):
+                    for j in range(i + 1, len(dtoks_a)):
+                        pair_k = f"ap_{min(dtoks_a[i], dtoks_a[j])}_{max(dtoks_a[i], dtoks_a[j])}"
+                        for s1_idx in self.query_index.get((CH_D2, c, pair_k), []):
+                            row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
+
+        # Channel E2: Symmetric Transliteration (Bit 16)
+        if self.ch_E2_enabled:
+            if n["trans_stripped"]:
+                for s1_idx in self.query_index.get((CH_E2, c, n["trans_stripped"]), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
+            if len(n["trans_compact"]) >= 6:
+                for s1_idx in self.query_index.get((CH_E2, c, n["trans_compact"]), []):
+                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
+            for ttok in n["trans_distinctive_tokens"]:
+                if len(ttok) >= self.e2_min_len:
+                    for s1_idx in self.query_index.get((CH_E2, c, f"ttok_{ttok}"), []):
+                        row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
+
+        # Channel F: Order-Invariant Name Token Pairs (Bit 32)
+        if self.ch_F_enabled and len(n["distinctive_tokens"]) >= 2:
+            dtoks = n["distinctive_tokens"][:4]
+            for i in range(len(dtoks)):
+                for j in range(i + 1, len(dtoks)):
+                    p_str = f"pair_{min(dtoks[i], dtoks[j])}_{max(dtoks[i], dtoks[j])}"
+                    for s1_idx in self.query_index.get((CH_F, c, p_str), []):
+                        row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_F
+
+        return row_s1_matches
 
     def generate_candidates_streaming(
         self,
@@ -536,101 +646,13 @@ class MultiChannelBlocker:
                         continue
                     rows_in_file += 1
                     total_scanned += 1
-
                     cand_id = parts[col_id]
                     c = parts[col_country]
                     raw_name = parts[col_name]
                     raw_addr = parts[col_addr]
 
-                    n = normalize_name_non_destructive(raw_name)
-                    row_s1_matches = {}
-
-                    # Channel A: Exact Normalized Name (Bit 1)
-                    if self.ch_A_enabled:
-                        if n["legal_stripped"]:
-                            for s1_idx in self.query_index.get((CH_A, c, n["legal_stripped"]), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_A
-                        if n["punct_norm"] and n["punct_norm"] != n["legal_stripped"]:
-                            for s1_idx in self.query_index.get((CH_A, c, n["punct_norm"]), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_A
-
-                    # Channel B: Compact & Domain (Bit 2)
-                    if self.ch_B_enabled:
-                        if len(n["compact_alnum"]) >= 4:
-                            for s1_idx in self.query_index.get((CH_B, c, n["compact_alnum"]), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
-                        if len(n["legal_stripped_compact"]) >= 4 and n["legal_stripped_compact"] != n["compact_alnum"]:
-                            for s1_idx in self.query_index.get((CH_B, c, n["legal_stripped_compact"]), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
-                        if n["domain_root"] and len(n["domain_root"]) >= 4:
-                            for s1_idx in self.query_index.get((CH_B, c, n["domain_root"]), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_B
-
-                    # Channel C2: Candidate-DF Rare Token (Bit 4)
-                    if self.ch_C2_enabled:
-                        for tok in n["distinctive_tokens"]:
-                            if len(tok) >= self.c2_min_len:
-                                for s1_idx in self.query_index.get((CH_C2, c, tok), []):
-                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_C2
-
-                    # Channel D2: True Address-Only Rescue (Bit 8)
-                    if self.ch_D2_enabled and raw_addr and raw_addr.lower() not in {"", "nan", "<null>", "null", "none"}:
-                        a = normalize_address_non_destructive(raw_addr)
-                        # Exact & compact
-                        if self.d2_exact and len(a["norm_unicode"]) >= 12:
-                            for s1_idx in self.query_index.get((CH_D2, c, f"exact_{a['norm_unicode']}"), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
-                        if self.d2_compact and len(a["compact_norm"]) >= 15:
-                            for s1_idx in self.query_index.get((CH_D2, c, f"compact_{a['compact_norm']}"), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
-
-                        # Building + Postal
-                        if a["building_numeric"] and a["postal_code"]:
-                            for s1_idx in self.query_index.get((CH_D2, c, f"bp_{a['building_numeric']}_{a['postal_code']}"), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
-
-                        # Building + street
-                        if self.d2_bldg_street and a["building_numeric"]:
-                            for st in a["street_tokens"][:2]:
-                                for s1_idx in self.query_index.get((CH_D2, c, f"bs_{a['building_numeric']}_{st}"), []):
-                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
-
-                        # Postal + street
-                        if self.d2_postal_street and a["postal_code"]:
-                            for st in a["street_tokens"][:2]:
-                                for s1_idx in self.query_index.get((CH_D2, c, f"ps_{a['postal_code']}_{st}"), []):
-                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
-
-                        # Address token pairs
-                        if self.d2_addr_pair and len(a["distinctive_tokens"]) >= 2:
-                            dtoks_a = a["distinctive_tokens"][:4]
-                            for i in range(len(dtoks_a)):
-                                for j in range(i + 1, len(dtoks_a)):
-                                    pair_k = f"ap_{min(dtoks_a[i], dtoks_a[j])}_{max(dtoks_a[i], dtoks_a[j])}"
-                                    for s1_idx in self.query_index.get((CH_D2, c, pair_k), []):
-                                        row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_D2
-
-                    # Channel E2: Symmetric Transliteration (Bit 16)
-                    if self.ch_E2_enabled:
-                        if n["trans_stripped"]:
-                            for s1_idx in self.query_index.get((CH_E2, c, n["trans_stripped"]), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
-                        if len(n["trans_compact"]) >= 6:
-                            for s1_idx in self.query_index.get((CH_E2, c, n["trans_compact"]), []):
-                                row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
-                        for ttok in n["trans_distinctive_tokens"]:
-                            if len(ttok) >= self.e2_min_len:
-                                for s1_idx in self.query_index.get((CH_E2, c, f"ttok_{ttok}"), []):
-                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_E2
-
-                    # Channel F: Order-Invariant Name Token Pairs (Bit 32)
-                    if self.ch_F_enabled and len(n["distinctive_tokens"]) >= 2:
-                        dtoks = n["distinctive_tokens"][:4]
-                        for i in range(len(dtoks)):
-                            for j in range(i + 1, len(dtoks)):
-                                p_str = f"pair_{min(dtoks[i], dtoks[j])}_{max(dtoks[i], dtoks[j])}"
-                                for s1_idx in self.query_index.get((CH_F, c, p_str), []):
-                                    row_s1_matches[s1_idx] = row_s1_matches.get(s1_idx, 0) | CH_F
+                    # Canonical candidate-side matching
+                    row_s1_matches = self.match_candidate_record(c, raw_name, raw_addr)
 
                     # Process all matches for this candidate row
                     if row_s1_matches:
@@ -679,12 +701,18 @@ class MultiChannelBlocker:
             total_scanned=total_scanned
         )
 
-    def compute_candidate_evidence_score(self, bitmask: int) -> float:
+    def compute_candidate_evidence_score(
+        self,
+        bitmask: int,
+        similarities: Optional[Dict[str, float]] = None
+    ) -> float:
         """
-        Computes deterministic retrieval evidence score for a candidate based on firing channels.
+        Computes deterministic retrieval evidence score for a candidate based on firing channels
+        and continuous similarity metadata (distinguishing high vs low cosine similarity).
         """
         score = 0.0
         channels_active = 0
+        sims = similarities or {}
 
         if bitmask & CH_A:
             score += self.weights.get("CH_A", 10.0)
@@ -705,13 +733,19 @@ class MultiChannelBlocker:
             score += self.weights.get("CH_F", 5.0)
             channels_active += 1
         if bitmask & CH_G_NAME:
-            score += self.weights.get("CH_G_NAME", 4.0)
+            w = self.weights.get("CH_G_NAME", 4.0)
+            sim_mult = sims.get("name", 1.0)
+            score += w * sim_mult
             channels_active += 1
         if bitmask & CH_G_ADDR:
-            score += self.weights.get("CH_G_ADDR", 4.0)
+            w = self.weights.get("CH_G_ADDR", 4.0)
+            sim_mult = sims.get("address", 1.0)
+            score += w * sim_mult
             channels_active += 1
         if bitmask & CH_G_TRANS:
-            score += self.weights.get("CH_G_TRANS", 4.0)
+            w = self.weights.get("CH_G_TRANS", 4.0)
+            sim_mult = sims.get("transliterated", 1.0)
+            score += w * sim_mult
             channels_active += 1
 
         if channels_active > 1:

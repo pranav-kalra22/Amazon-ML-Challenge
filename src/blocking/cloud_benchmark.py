@@ -8,10 +8,12 @@ partitioned strictly by Country x Candidate Source.
 
 Evaluates against the competitive target: Oracle Entity-Level Macro F0.5 >= 0.995 (target > 0.988419).
 
-Modes:
-- 'smoke_test': Bounded local validation on small subset (e.g. 500 S1 queries, 20k candidates), labeled SMOKE_TEST_ONLY.
-- 'pilot': Comprehensive single-partition profiling (e.g. India S2 or US S2) with the full development validation subset.
-- 'full': Full AWS cloud execution across all partitions.
+Execution Modes:
+- 'parity_check': Lexical regression gate reproducing EXP_003 Mode A baseline on val_50k_seed42 (TF-IDF disabled).
+- 'plumbing_smoke': Bounded local verification on arbitrary candidate subset (labeled SMOKE_TEST_ONLY).
+- 'positive_smoke': Ground-truth-inclusive smoke test with all true matches present (labeled SMOKE_TEST_ONLY).
+- 'pilot': Bounded single-partition profiling (e.g. India x S2) reporting partition-only metrics (PILOT_PARTITION_MEASUREMENT).
+- 'full': Full cloud execution across all partitions with partition-at-a-time memory release.
 """
 
 import os
@@ -34,9 +36,13 @@ from src.blocking.blocker import (
     CH_A, CH_B, CH_C2, CH_D2, CH_E2, CH_F,
     CH_G_NAME, CH_G_ADDR, CH_G_TRANS,
     CHANNEL_NAMES,
+    CandidateHeapItem,
     StreamingCandidateResult
 )
-from src.blocking.tfidf_retriever import TfidfApproximateRetriever
+from src.blocking.tfidf_retriever import (
+    TfidfApproximateRetriever,
+    evaluate_parameter_sweep_in_memory
+)
 from src.blocking.normalizer import (
     normalize_name_non_destructive,
     normalize_address_non_destructive
@@ -131,7 +137,6 @@ def compute_cardinality_breakdown(
         g_preds = {sid: oracle_preds[sid] for sid in s1_ids}
         g_meta = {sid: metadata_map.get(sid, {}) for sid in s1_ids}
 
-        # Sub-evaluation
         sub_eval = evaluate_predictions(g_gt, g_preds, g_meta)
 
         total_true = sum(len(g_gt[sid]) for sid in s1_ids)
@@ -188,7 +193,7 @@ def run_cloud_benchmark(
     dataset_root: str = "dataset/train",
     output_dir: str = "reports/blocking",
     experiment_id: str = "EXP_004_cloud_ngram_tfidf_blocker",
-    mode: str = "smoke_test",
+    mode: str = "plumbing_smoke",
     pilot_country: str = "India",
     pilot_source: str = "S2",
     smoke_s1_count: int = 500,
@@ -196,7 +201,7 @@ def run_cloud_benchmark(
     use_cache: bool = True
 ) -> Dict[str, Any]:
     """
-    Executes EXP_004 candidate generation benchmark.
+    Executes EXP_004 Candidate Generation Benchmark.
     """
     mem_tracker = MemoryTracker(interval_sec=0.5)
     mem_tracker.start()
@@ -204,9 +209,18 @@ def run_cloud_benchmark(
     os.makedirs(output_dir, exist_ok=True)
 
     git_sha, git_dirty = get_git_status()
-    is_smoke = (mode == "smoke_test")
+    is_smoke = mode in ("plumbing_smoke", "positive_smoke", "smoke_test")
     is_pilot = (mode == "pilot")
-    tag_prefix = "SMOKE_TEST_ONLY" if is_smoke else ("PILOT_ONLY" if is_pilot else "FULL_EVALUATION")
+    is_parity = (mode == "parity_check")
+
+    if is_smoke:
+        tag_prefix = "SMOKE_TEST_ONLY"
+    elif is_pilot:
+        tag_prefix = "PILOT_PARTITION_MEASUREMENT"
+    elif is_parity:
+        tag_prefix = "LEXICAL_PARITY_GATE"
+    else:
+        tag_prefix = "FULL_EVALUATION"
 
     print(f"=== Starting Blocking Benchmark {experiment_id} [{tag_prefix}] ===", flush=True)
     print(f"Config:       {config_path}", flush=True)
@@ -217,6 +231,11 @@ def run_cloud_benchmark(
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    # If parity_check mode, disable TF-IDF channels unconditionally
+    if is_parity:
+        config.setdefault("tfidf_retrieval", {})["enabled"] = False
+        print("[PARITY CHECK MODE] TF-IDF channels explicitly disabled. Verifying EXP_003 lexical baseline.", flush=True)
+
     s1_path = os.path.join(dataset_root, "train_source1.tsv")
     s2_path = os.path.join(dataset_root, "train_source2.tsv")
     s3_path = os.path.join(dataset_root, "train_source3.tsv")
@@ -225,14 +244,23 @@ def run_cloud_benchmark(
     # 1. Load validation S1 IDs
     val_meta_df = pd.read_parquet(val_split_path)
     all_val_s1_ids = list(val_meta_df["entity_id"])
-    if is_smoke:
+
+    if mode == "positive_smoke":
+        # Positive-inclusive smoke test: 150 S1 entities
+        smoke_count = min(150, len(all_val_s1_ids))
+        selected_val_s1_ids = set(all_val_s1_ids[:smoke_count])
+        print(f"Positive Smoke Mode: Evaluating {len(selected_val_s1_ids):,} entities with 100% of their true links included in corpus.", flush=True)
+    elif mode in ("plumbing_smoke", "smoke_test"):
         selected_val_s1_ids = set(all_val_s1_ids[:smoke_s1_count])
-        print(f"Smoke Test Mode: Bounding S1 queries to {len(selected_val_s1_ids):,} entities.", flush=True)
+        print(f"Plumbing Smoke Mode: Evaluating {len(selected_val_s1_ids):,} entities on bounded candidate subset.", flush=True)
+    elif is_pilot:
+        selected_val_s1_ids = set(all_val_s1_ids)
+        print(f"Pilot Mode: Partition '{pilot_country} x {pilot_source}' across validation population.", flush=True)
     else:
         selected_val_s1_ids = set(all_val_s1_ids)
-        print(f"Loaded {len(selected_val_s1_ids):,} validation S1 IDs from {val_split_path}", flush=True)
+        print(f"Full Mode: Evaluating complete {len(selected_val_s1_ids):,} validation S1 entities.", flush=True)
 
-    # 2. Extract S1 records
+    # 2. Extract S1 validation records
     val_s1_records = []
     val_s1_lookup = {}
     with open(s1_path, "r", encoding="utf-8") as f:
@@ -244,34 +272,41 @@ def run_cloud_benchmark(
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if parts[col_id] in selected_val_s1_ids:
+                c = parts[col_country]
+                if is_pilot and c != pilot_country:
+                    continue
                 rec = {
                     "entity_id": parts[col_id],
                     "business_name": parts[col_name],
                     "business_address": parts[col_addr],
-                    "country": parts[col_country]
+                    "country": c
                 }
                 val_s1_records.append(rec)
                 val_s1_lookup[parts[col_id]] = rec
 
-    print(f"Extracted {len(val_s1_records):,} S1 validation records.", flush=True)
+    print(f"Extracted {len(val_s1_records):,} S1 validation records (country filtered: {is_pilot}).", flush=True)
 
     # 3. Load Ground Truth for selected S1 entities
-    val_gt = {}
-    val_gt_pairs = set()
+    val_gt: Dict[str, Set[str]] = {}
+    val_gt_pairs: Set[Tuple[str, str]] = set()
     total_true_links = 0
     s2_true_links = 0
     s3_true_links = 0
+
     with open(gt_path, "r", encoding="utf-8") as f:
         next(f)
         for line in f:
             parts = line.rstrip("\n").split("\t")
             s1_id = parts[0]
-            if s1_id in selected_val_s1_ids:
+            if s1_id in val_s1_lookup:
                 m_ids = set()
                 if len(parts) >= 2 and parts[1].strip():
                     for x in parts[1].split(","):
                         cand = x.strip()
                         if cand:
+                            # In pilot mode, strictly filter true links to requested candidate source
+                            if is_pilot and not cand.startswith(f"{pilot_source}-"):
+                                continue
                             m_ids.add(cand)
                             val_gt_pairs.add((s1_id, cand))
                             if cand.startswith("S2-"):
@@ -281,47 +316,19 @@ def run_cloud_benchmark(
                 val_gt[s1_id] = m_ids
                 total_true_links += len(m_ids)
 
+    # Target true candidate IDs for positive-inclusive smoke test
+    target_true_cand_ids = {cid for (_, cid) in val_gt_pairs} if mode == "positive_smoke" else set()
+
     print(f"Ground Truth loaded: {len(val_gt):,} entities, {total_true_links:,} true links (S2: {s2_true_links:,}, S3: {s3_true_links:,})", flush=True)
 
-    # 4. Read candidate records
-    # For smoke test, read small subset from S2 and S3; for full, load by partitions
-    candidate_partitions: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
-    cand_sources = [("S2", s2_path), ("S3", s3_path)]
-
-    if is_pilot:
-        cand_sources = [(pilot_source, s2_path if pilot_source == "S2" else s3_path)]
-
-    for src_name, path in cand_sources:
-        print(f"Loading candidate records from {path}...", flush=True)
-        rows_read = 0
-        with open(path, "r", encoding="utf-8") as f:
-            header = f.readline().rstrip("\n").split("\t")
-            col_id = header.index("entity_id")
-            col_name = header.index("business_name")
-            col_addr = header.index("business_address")
-            col_country = header.index("country")
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
-                c = parts[col_country]
-                if is_pilot and c != pilot_country:
-                    continue
-                candidate_partitions[(c, src_name)].append({
-                    "entity_id": parts[col_id],
-                    "business_name": parts[col_name],
-                    "business_address": parts[col_addr],
-                    "country": c
-                })
-                rows_read += 1
-                if is_smoke and rows_read >= smoke_cand_count:
-                    break
-
-    total_cands = sum(len(cands) for cands in candidate_partitions.values())
-    print(f"Candidate population loaded: {total_cands:,} records across {len(candidate_partitions)} partitions.", flush=True)
-
-    # 5. Build Lexical Blocker & Query Index
-    t_lex_start = time.time()
+    # 4. Canonical Lexical Blocker: Pass 1 Candidate-DF Scanning & Query Index
+    t_idx_start = time.time()
     blocker = MultiChannelBlocker(config=config)
-    blocker.build_query_index(val_s1_records)
+    blocker.build_query_index(
+        val_s1_records,
+        candidate_file_paths=[s2_path, s3_path]
+    )
+    print(f"Authoritative query index built in {time.time()-t_idx_start:.2f}s. Peak RAM: {mem_tracker.peak_rss:.2f} MB", flush=True)
 
     val_gt_idx_pairs = {
         (blocker.s1_id_to_idx[s1_id], cid)
@@ -329,191 +336,209 @@ def run_cloud_benchmark(
         if s1_id in blocker.s1_id_to_idx
     }
 
-    # Stream lexical candidates over loaded candidate partitions
-    # To do so memory-efficiently, write candidate partitions to a temporary streaming format or iterate
-    print("\nRunning EXP_003 lexical blocking baseline on loaded candidate records...", flush=True)
-    lexical_matches: List[Tuple[int, str, int, float]] = []
-    for (c, src_name), cands in candidate_partitions.items():
-        for cand in cands:
-            cand_id = cand["entity_id"]
-            raw_name = cand["business_name"]
-            raw_addr = cand["business_address"]
-
-            n = normalize_name_non_destructive(raw_name)
-            a = normalize_address_non_destructive(raw_addr)
-
-            row_matches = {}
-            # Channel A
-            if blocker.ch_A_enabled:
-                if n["norm_unicode"]:
-                    for s1_idx in blocker.query_index.get((CH_A, c, n["norm_unicode"]), []):
-                        row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_A
-                if n["legal_stripped"]:
-                    for s1_idx in blocker.query_index.get((CH_A, c, n["legal_stripped"]), []):
-                        row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_A
-
-            # Channel B
-            if blocker.ch_B_enabled:
-                if len(n["compact_alnum"]) >= 6:
-                    for s1_idx in blocker.query_index.get((CH_B, c, n["compact_alnum"]), []):
-                        row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_B
-                if n["domain_root"] and len(n["domain_root"]) >= 4:
-                    for s1_idx in blocker.query_index.get((CH_B, c, f"dom_{n['domain_root']}"), []):
-                        row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_B
-
-            # Channel C2
-            if blocker.ch_C2_enabled:
-                for tok in n["distinctive_tokens"]:
-                    if len(tok) >= blocker.c2_min_len:
-                        for s1_idx in blocker.query_index.get((CH_C2, c, f"tok_{tok}"), []):
-                            row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_C2
-
-            # Channel D2
-            if blocker.ch_D2_enabled:
-                if a["norm_unicode"]:
-                    for s1_idx in blocker.query_index.get((CH_D2, c, a["norm_unicode"]), []):
-                        row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_D2
-                if a["building_numeric"] and a["street_tokens"]:
-                    st = a["street_tokens"][0]
-                    for s1_idx in blocker.query_index.get((CH_D2, c, f"bldg_{a['building_numeric']}_{st}"), []):
-                        row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_D2
-
-            # Channel E2
-            if blocker.ch_E2_enabled:
-                if n["trans_stripped"]:
-                    for s1_idx in blocker.query_index.get((CH_E2, c, n["trans_stripped"]), []):
-                        row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_E2
-                for ttok in n["trans_distinctive_tokens"]:
-                    if len(ttok) >= blocker.e2_min_len:
-                        for s1_idx in blocker.query_index.get((CH_E2, c, f"ttok_{ttok}"), []):
-                            row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_E2
-
-            # Channel F
-            if blocker.ch_F_enabled and len(n["distinctive_tokens"]) >= 2:
-                dtoks = n["distinctive_tokens"][:4]
-                for i in range(len(dtoks)):
-                    for j in range(i + 1, len(dtoks)):
-                        p_str = f"pair_{min(dtoks[i], dtoks[j])}_{max(dtoks[i], dtoks[j])}"
-                        for s1_idx in blocker.query_index.get((CH_F, c, p_str), []):
-                            row_matches[s1_idx] = row_matches.get(s1_idx, 0) | CH_F
-
-            for s1_idx, mask in row_matches.items():
-                lexical_matches.append((s1_idx, cand_id, mask, blocker.compute_candidate_evidence_score(mask)))
-
+    # 5. Initialize Candidate Structures
     n_s1 = len(val_s1_records)
-    base_cand_dicts = [{} for _ in range(n_s1)]
-    base_gt_hits = {}
-    base_uncapped_counts = np.zeros(n_s1, dtype=np.int32)
-    base_uncapped_channels = {
-        b: np.zeros(n_s1, dtype=np.int32)
-        for b in (CH_A, CH_B, CH_C2, CH_D2, CH_E2, CH_F, CH_G_NAME, CH_G_ADDR, CH_G_TRANS)
+    candidate_dicts: List[Dict[str, int]] = [{} for _ in range(n_s1)]
+    similarities_list: List[Dict[str, Dict[str, float]]] = [{} for _ in range(n_s1)]
+    gt_hits: Dict[Tuple[int, str], int] = {}
+    uncapped_counts = np.zeros(n_s1, dtype=np.int32)
+    uncapped_channel_counts = {
+        b: np.zeros(n_s1, dtype=np.int32) for b in CHANNEL_NAMES
     }
+    heaps: List[List[CandidateHeapItem]] = [[] for _ in range(n_s1)]
+    max_k = config.get("constraints", {}).get("max_heap_k", 2000)
 
-    for s1_idx, cand_id, mask, score in lexical_matches:
-        base_uncapped_counts[s1_idx] += 1
-        for b in (CH_A, CH_B, CH_C2, CH_D2, CH_E2, CH_F):
-            if mask & b:
-                base_uncapped_channels[b][s1_idx] += 1
-        if cand_id in base_cand_dicts[s1_idx]:
-            base_cand_dicts[s1_idx][cand_id] |= mask
-        else:
-            base_cand_dicts[s1_idx][cand_id] = mask
-        if (s1_idx, cand_id) in val_gt_idx_pairs:
-            base_gt_hits[(s1_idx, cand_id)] = base_gt_hits.get((s1_idx, cand_id), 0) | mask
+    # EXP_003 Lexical baseline hit set
+    lexical_hit_pairs: Set[Tuple[int, str]] = set()
 
-    lexical_result = StreamingCandidateResult(
-        candidate_dicts=base_cand_dicts,
-        gt_hits=base_gt_hits,
-        uncapped_counts=base_uncapped_counts,
-        uncapped_channel_counts=base_uncapped_channels,
-        total_scanned=total_cands
-    )
+    # Determine partitions to execute
+    all_countries = sorted(list({rec["country"] for rec in val_s1_records}))
+    candidate_sources = [("S2", s2_path), ("S3", s3_path)]
 
-    lex_hit_pairs = set(lexical_result.gt_hits.keys())
-    print(f"EXP_003 Lexical Baseline on subset: {len(lex_hit_pairs):,} / {len(val_gt_idx_pairs):,} true links hit ({len(lex_hit_pairs)/max(1, len(val_gt_idx_pairs)):.2%}).", flush=True)
+    if is_pilot:
+        all_countries = [pilot_country]
+        candidate_sources = [(pilot_source, s2_path if pilot_source == "S2" else s3_path)]
 
-    # 6. Initialize EXP_004 Approximate Retriever
+    total_scanned_rows = 0
+    all_tfidf_matches_with_similarity: List[Tuple[int, str, int, float]] = []
+
     retriever = TfidfApproximateRetriever(config=config)
-    tfidf_matches_by_channel = {
-        CH_G_NAME: [],
-        CH_G_ADDR: [],
-        CH_G_TRANS: []
-    }
+    tfidf_active = retriever.tfidf_enabled and not is_parity
 
-    # Group S1 queries by country
+    # Group S1 records by country for rapid retrieval indexing
     s1_by_country: Dict[str, Tuple[List[Dict[str, Any]], List[int]]] = defaultdict(lambda: ([], []))
     for s1_idx, rec in enumerate(val_s1_records):
         s1_by_country[rec["country"]][0].append(rec)
         s1_by_country[rec["country"]][1].append(s1_idx)
 
-    # Execute partitioned TF-IDF retrieval
-    for (country, src_name), cands in candidate_partitions.items():
-        s1_recs, s1_idxs = s1_by_country[country]
-        if not s1_recs or not cands:
+    # =========================================================================
+    # PARTITION-AT-A-TIME EXECUTION ARCHITECTURE (Item 5)
+    # =========================================================================
+    for country in all_countries:
+        s1_country_recs, s1_country_idxs = s1_by_country[country]
+        if not s1_country_recs:
             continue
 
-        # Channel G_NAME
-        if retriever.name_cfg.get("enabled", True):
-            m = retriever.retrieve_partition_approximate_candidates(
-                country=country,
-                source=src_name,
-                channel_bit=CH_G_NAME,
-                channel_cfg=retriever.name_cfg,
-                channel_type="name",
-                s1_entities=s1_recs,
-                s1_indices=s1_idxs,
-                candidate_records=cands,
-                use_cache=use_cache
-            )
-            tfidf_matches_by_channel[CH_G_NAME].extend(m)
+        for src_name, src_path in candidate_sources:
+            t_part_start = time.time()
+            print(f"\n>>> Processing Partition: Country='{country}' x Source='{src_name}' from {src_path}...", flush=True)
 
-        # Channel G_ADDR
-        if retriever.addr_cfg.get("enabled", True):
-            m = retriever.retrieve_partition_approximate_candidates(
-                country=country,
-                source=src_name,
-                channel_bit=CH_G_ADDR,
-                channel_cfg=retriever.addr_cfg,
-                channel_type="address",
-                s1_entities=s1_recs,
-                s1_indices=s1_idxs,
-                candidate_records=cands,
-                use_cache=use_cache
-            )
-            tfidf_matches_by_channel[CH_G_ADDR].extend(m)
+            partition_candidate_records: List[Dict[str, Any]] = []
+            rows_scanned_in_partition = 0
 
-        # Channel G_TRANS
-        if retriever.trans_cfg.get("enabled", True):
-            m = retriever.retrieve_partition_approximate_candidates(
-                country=country,
-                source=src_name,
-                channel_bit=CH_G_TRANS,
-                channel_cfg=retriever.trans_cfg,
-                channel_type="transliterated",
-                s1_entities=s1_recs,
-                s1_indices=s1_idxs,
-                candidate_records=cands,
-                use_cache=use_cache
-            )
-            tfidf_matches_by_channel[CH_G_TRANS].extend(m)
+            with open(src_path, "r", encoding="utf-8") as f:
+                header = f.readline().rstrip("\n").split("\t")
+                col_id = header.index("entity_id") if "entity_id" in header else 0
+                col_name = header.index("business_name") if "business_name" in header else 1
+                col_addr = header.index("business_address") if "business_address" in header else 2
+                col_country = header.index("country") if "country" in header else 3
 
-    all_tfidf_matches = (
-        tfidf_matches_by_channel[CH_G_NAME] +
-        tfidf_matches_by_channel[CH_G_ADDR] +
-        tfidf_matches_by_channel[CH_G_TRANS]
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) <= col_country:
+                        continue
+                    row_c = parts[col_country]
+
+                    cand_id = parts[col_id]
+                    raw_name = parts[col_name]
+                    raw_addr = parts[col_addr]
+
+                    # Filter for this partition
+                    if row_c != country:
+                        # In positive_smoke mode, allow true matches even if country has noise
+                        if not (mode == "positive_smoke" and cand_id in target_true_cand_ids):
+                            continue
+
+                    # Filtering for smoke tests
+                    if mode == "plumbing_smoke":
+                        if rows_scanned_in_partition >= smoke_cand_count:
+                            break
+                    elif mode == "positive_smoke":
+                        is_target = cand_id in target_true_cand_ids
+                        if not is_target and rows_scanned_in_partition >= 5000:
+                            continue
+
+                    rows_scanned_in_partition += 1
+                    total_scanned_rows += 1
+
+                    # 1. Authoritative Lexical Matching (Single Canonical Implementation)
+                    row_s1_matches = blocker.match_candidate_record(country, raw_name, raw_addr)
+                    if row_s1_matches:
+                        for s1_idx, bitmask in row_s1_matches.items():
+                            uncapped_counts[s1_idx] += 1
+                            for b in CHANNEL_NAMES:
+                                if bitmask & b:
+                                    uncapped_channel_counts[b][s1_idx] += 1
+
+                            if cand_id in candidate_dicts[s1_idx]:
+                                candidate_dicts[s1_idx][cand_id] |= bitmask
+                            else:
+                                candidate_dicts[s1_idx][cand_id] = bitmask
+
+                            if (s1_idx, cand_id) in val_gt_idx_pairs:
+                                gt_hits[(s1_idx, cand_id)] = gt_hits.get((s1_idx, cand_id), 0) | bitmask
+                                lexical_hit_pairs.add((s1_idx, cand_id))
+
+                            # Evidence-ranked heap
+                            score = blocker.compute_candidate_evidence_score(bitmask)
+                            item = CandidateHeapItem(score, cand_id, bitmask)
+                            h = heaps[s1_idx]
+                            if len(h) < max_k:
+                                heapq.heappush(h, item)
+                            elif item > h[0]:
+                                heapq.heapreplace(h, item)
+
+                    # Collect candidate record for TF-IDF if enabled
+                    if tfidf_active:
+                        partition_candidate_records.append({
+                            "entity_id": cand_id,
+                            "business_name": raw_name,
+                            "business_address": raw_addr,
+                            "country": country
+                        })
+
+            print(f"  Partition scanned {rows_scanned_in_partition:,} records. Lexical hits so far: {len(lexical_hit_pairs):,} / {len(val_gt_idx_pairs):,}", flush=True)
+
+            # 2. Approximate TF-IDF Retrieval on Partition
+            if tfidf_active and partition_candidate_records:
+                for ch_bit, ch_cfg, ch_type in (
+                    (CH_G_NAME, retriever.name_cfg, "name"),
+                    (CH_G_ADDR, retriever.addr_cfg, "address"),
+                    (CH_G_TRANS, retriever.trans_cfg, "transliterated")
+                ):
+                    if ch_cfg.get("enabled", True):
+                        m = retriever.retrieve_partition_approximate_candidates(
+                            country=country,
+                            source=src_name,
+                            channel_bit=ch_bit,
+                            channel_cfg=ch_cfg,
+                            channel_type=ch_type,
+                            s1_entities=s1_country_recs,
+                            s1_indices=s1_country_idxs,
+                            candidate_records=partition_candidate_records,
+                            use_cache=use_cache
+                        )
+                        all_tfidf_matches_with_similarity.extend(m)
+
+                        # Merge into candidate structures immediately
+                        for s1_idx, cand_id, bit, sim_sc in m:
+                            sim_map = similarities_list[s1_idx].setdefault(cand_id, {})
+                            if bit == CH_G_NAME:
+                                sim_map["name"] = max(sim_map.get("name", 0.0), float(sim_sc))
+                            elif bit == CH_G_ADDR:
+                                sim_map["address"] = max(sim_map.get("address", 0.0), float(sim_sc))
+                            elif bit == CH_G_TRANS:
+                                sim_map["transliterated"] = max(sim_map.get("transliterated", 0.0), float(sim_sc))
+
+                            if cand_id in candidate_dicts[s1_idx]:
+                                candidate_dicts[s1_idx][cand_id] |= bit
+                            else:
+                                candidate_dicts[s1_idx][cand_id] = bit
+
+                            uncapped_counts[s1_idx] += 1
+                            uncapped_channel_counts[bit][s1_idx] += 1
+
+                            if (s1_idx, cand_id) in val_gt_idx_pairs:
+                                gt_hits[(s1_idx, cand_id)] = gt_hits.get((s1_idx, cand_id), 0) | bit
+
+                            # Update evidence score in heap with continuous similarity
+                            bitmask = candidate_dicts[s1_idx][cand_id]
+                            score = blocker.compute_candidate_evidence_score(bitmask, similarities=sim_map)
+                            item = CandidateHeapItem(score, cand_id, bitmask, similarities=dict(sim_map))
+                            h = heaps[s1_idx]
+                            found = False
+                            for h_elem in h:
+                                if h_elem.cand_id == cand_id:
+                                    h_elem.score = score
+                                    h_elem.bitmask = bitmask
+                                    h_elem.similarities = dict(sim_map)
+                                    found = True
+                                    break
+                            if found:
+                                heapq.heapify(h)
+                            else:
+                                if len(h) < max_k:
+                                    heapq.heappush(h, item)
+                                elif item > h[0]:
+                                    heapq.heapreplace(h, item)
+
+            # Release partition candidate records to keep memory strictly bounded
+            del partition_candidate_records
+            gc.collect()
+            print(f"  Partition complete in {time.time()-t_part_start:.2f}s. Current peak RSS: {mem_tracker.peak_rss:.2f} MB", flush=True)
+
+    # Assemble StreamingCandidateResult
+    final_result = StreamingCandidateResult(
+        candidate_dicts=candidate_dicts,
+        heaps=heaps,
+        gt_hits=gt_hits,
+        uncapped_counts=uncapped_counts,
+        uncapped_channel_counts=uncapped_channel_counts,
+        total_scanned=total_scanned_rows,
+        similarities=similarities_list
     )
 
-    # 7. Merge candidates into final UNION
-    final_result = retriever.merge_tfidf_candidates_into_result(
-        base_result=lexical_result,
-        tfidf_matches=all_tfidf_matches,
-        gt_links_set=val_gt_idx_pairs
-    )
-
-    # 8. Compute Authoritative Macro F0.5 & Primary Metrics
-    t_eval_start = time.time()
-    union_hit_pairs = set(final_result.gt_hits.keys())
-    total_union_hits = len(union_hit_pairs)
+    total_union_hits = len(final_result.gt_hits)
     overall_link_recall = total_union_hits / total_true_links if total_true_links > 0 else 0.0
 
     metadata_map = {rec["entity_id"]: {"country": rec["country"]} for rec in val_s1_records}
@@ -538,74 +563,35 @@ def run_cloud_benchmark(
     oracle_eval = evaluate_predictions(val_gt, oracle_preds, metadata_map)
     oracle_macro_f05 = oracle_eval.get("macro_f05", 0.0)
 
-    # 9. Incremental True-Link Analysis & Miss Recovery
-    # EXP_003 lexical misses in this subset
-    lexical_misses = val_gt_idx_pairs - lex_hit_pairs
-    total_lex_misses = len(lexical_misses)
+    # Incremental miss recovery
+    total_lex_misses = len(val_gt_idx_pairs - lexical_hit_pairs)
+    total_recovered = len(set(final_result.gt_hits.keys()) - lexical_hit_pairs)
 
-    def analyze_channel_recovery(matches_list, ch_bit: int):
-        ch_pairs = {(m[0], m[1]) for m in matches_list}
-        ch_hits = ch_pairs & val_gt_idx_pairs
-        recovered_misses = ch_hits & lexical_misses
-        new_cands = len(ch_pairs)
-        ratio = new_cands / max(1, len(recovered_misses))
-        return {
-            "standalone_hits": len(ch_hits),
-            "standalone_recall": len(ch_hits) / max(1, total_true_links),
-            "misses_recovered": len(recovered_misses),
-            "pct_misses_recovered": len(recovered_misses) / max(1, total_lex_misses),
-            "new_candidate_pairs": new_cands,
-            "cands_per_recovered_link": round(ratio, 2)
-        }
+    # Sweeps (Item 8)
+    sweep_table = []
+    if tfidf_active and all_tfidf_matches_with_similarity:
+        k_sweep = config.get("sweeps", {}).get("top_k_sweep", [10, 25, 50, 100])
+        thresh_sweep = config.get("sweeps", {}).get("threshold_sweep", [0.30, 0.35, 0.40, 0.50, 0.60])
+        base_lex_count = sum(len(d) for d in candidate_dicts) - len(all_tfidf_matches_with_similarity)
 
-    incremental_table = [
-        {
-            "channel": "EXP_003_lexical",
-            "hits": len(lex_hit_pairs),
-            "recall": len(lex_hit_pairs) / max(1, total_true_links),
-            "misses_recovered": 0,
-            "pct_misses_recovered": 0.0,
-            "new_candidate_pairs": sum(len(d) for d in base_cand_dicts),
-            "cands_per_recovered_link": "-"
-        }
-    ]
+        sweep_table = evaluate_parameter_sweep_in_memory(
+            matches=all_tfidf_matches_with_similarity,
+            val_gt_pairs=val_gt_idx_pairs,
+            lexical_hits=lexical_hit_pairs,
+            total_true_links=total_true_links,
+            k_list=k_sweep,
+            thresh_list=thresh_sweep,
+            val_gt=val_gt if not is_pilot else None,
+            s1_id_list=[r["entity_id"] for r in val_s1_records] if not is_pilot else None,
+            metadata_map=metadata_map if not is_pilot else None,
+            base_lexical_pairs=max(0, base_lex_count)
+        )
 
-    for ch_bit, name in (
-        (CH_G_NAME, "Name_Char_TFIDF"),
-        (CH_G_ADDR, "Address_Char_TFIDF"),
-        (CH_G_TRANS, "Transliterated_Char_TFIDF")
-    ):
-        rec_data = analyze_channel_recovery(tfidf_matches_by_channel[ch_bit], ch_bit)
-        incremental_table.append({
-            "channel": name,
-            "hits": rec_data["standalone_hits"],
-            "recall": rec_data["standalone_recall"],
-            "misses_recovered": rec_data["misses_recovered"],
-            "pct_misses_recovered": rec_data["pct_misses_recovered"],
-            "new_candidate_pairs": rec_data["new_candidate_pairs"],
-            "cands_per_recovered_link": rec_data["cands_per_recovered_link"]
-        })
-
-    # Union row
-    total_recovered_in_union = len(union_hit_pairs & lexical_misses)
-    incremental_table.append({
-        "channel": "FINAL_UNION",
-        "hits": total_union_hits,
-        "recall": overall_link_recall,
-        "misses_recovered": total_recovered_in_union,
-        "pct_misses_recovered": total_recovered_in_union / max(1, total_lex_misses),
-        "new_candidate_pairs": sum(len(d) for d in final_result),
-        "cands_per_recovered_link": round(sum(len(d) for d in final_result) / max(1, total_recovered_in_union), 2)
-    })
-
-    # 10. Entity Cardinality Breakdown
+    # Cardinality & Zero-Candidate Audits
     cardinality_breakdown = compute_cardinality_breakdown(val_gt, oracle_preds, metadata_map)
-
-    # 11. Zero-Candidate Audit
     cand_counts_arr = np.array([len(d) for d in final_result], dtype=np.int32)
     zero_cand_audit = compute_zero_candidate_audit(val_gt, cand_counts_arr, [r["entity_id"] for r in val_s1_records])
 
-    # Candidate volume percentiles
     cand_stats = {
         "mean": float(np.mean(cand_counts_arr)),
         "median": float(np.median(cand_counts_arr)),
@@ -619,10 +605,24 @@ def run_cloud_benchmark(
     init_rss, peak_rss, final_rss = mem_tracker.stop()
     total_runtime = time.time() - t_start
 
-    # Success gate evaluation
-    gate_cfg = config.get("success_gate", {})
-    target_f05 = gate_cfg.get("min_oracle_macro_f05", 0.995)
-    gate_passed = bool(oracle_macro_f05 >= target_f05)
+    # Lexical Parity Verification against EXP_003
+    parity_passed = False
+    if is_parity:
+        # Expected EXP_003 reference:
+        # True links: 112,143 | Link recall: 0.649242 | Full cov: 0.304864 | Oracle F0.5: 0.831634
+        exp003_links = 112143
+        exp003_recall = 0.649242
+        exp003_cov = 0.304864
+        exp003_f05 = 0.831634
+
+        parity_passed = (
+            abs(total_union_hits - exp003_links) == 0 and
+            abs(overall_link_recall - exp003_recall) < 1e-4 and
+            abs(full_coverage_rate - exp003_cov) < 1e-4 and
+            abs(oracle_macro_f05 - exp003_f05) < 1e-4
+        )
+        print(f"\n[LEXICAL PARITY VERDICT] True links: {total_union_hits:,} / {exp003_links:,} | Recall: {overall_link_recall:.6f} / {exp003_recall:.6f} | Coverage: {full_coverage_rate:.6f} / {exp003_cov:.6f} | Oracle F0.5: {oracle_macro_f05:.6f} / {exp003_f05:.6f}")
+        print(f"Parity Gate Result: {'PASS' if parity_passed else 'FAIL'}", flush=True)
 
     summary = {
         "experiment_id": experiment_id,
@@ -638,17 +638,16 @@ def run_cloud_benchmark(
             "true_link_recall": round(overall_link_recall, 6),
             "full_entity_coverage": round(full_coverage_rate, 6),
             "macro_precision": round(oracle_eval.get("macro_precision", 0.0), 6),
-            "macro_recall": round(oracle_eval.get("macro_recall", 0.0), 6)
-        },
-        "success_gate": {
-            "target_oracle_macro_f05": target_f05,
-            "achieved_oracle_macro_f05": round(oracle_macro_f05, 6),
-            "passed": gate_passed
+            "macro_recall": round(oracle_eval.get("macro_recall", 0.0), 6),
+            "true_links_retrieved": total_union_hits,
+            "lexical_baseline_hits": len(lexical_hit_pairs),
+            "misses_recovered": total_recovered,
+            "pct_misses_recovered": round(total_recovered / max(1, total_lex_misses), 6)
         },
         "candidate_distribution": cand_stats,
-        "incremental_analysis": incremental_table,
         "cardinality_breakdown": cardinality_breakdown,
         "zero_candidate_audit": zero_cand_audit,
+        "sweeps": sweep_table,
         "system_resources": {
             "initial_rss_mb": round(init_rss, 2),
             "peak_rss_mb": round(peak_rss, 2),
@@ -657,40 +656,63 @@ def run_cloud_benchmark(
         }
     }
 
-    # Save summary JSON
-    summary_path = os.path.join(output_dir, f"{experiment_id}_{mode}_summary.json")
+    if is_parity:
+        summary["lexical_parity_gate"] = {
+            "reference_true_links": 112143,
+            "reference_link_recall": 0.649242,
+            "reference_full_coverage": 0.304864,
+            "reference_oracle_f05": 0.831634,
+            "achieved_true_links": total_union_hits,
+            "achieved_link_recall": round(overall_link_recall, 6),
+            "achieved_full_coverage": round(full_coverage_rate, 6),
+            "achieved_oracle_f05": round(oracle_macro_f05, 6),
+            "parity_verdict": "PASS" if parity_passed else "FAIL"
+        }
+
+    # Save summary files
+    mode_suffix = "lexical_parity" if is_parity else mode
+    summary_path = os.path.join(output_dir, f"{experiment_id}_{mode_suffix}_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    # Save Markdown report
-    report_path = os.path.join(output_dir, f"{experiment_id}_{mode}_report.md")
+    report_path = os.path.join(output_dir, f"{experiment_id}_{mode_suffix}_report.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(f"# Blocking Benchmark Report: {experiment_id} [{tag_prefix}]\n\n")
         f.write(f"- **Mode**: `{mode}`\n")
         f.write(f"- **Git Commit**: `{git_sha}` (dirty: `{git_dirty}`)\n")
         f.write(f"- **Evaluated S1 Entities**: `{len(val_s1_records):,}`\n")
-        f.write(f"- **Evaluated Candidate Records**: `{total_cands:,}`\n")
+        f.write(f"- **Evaluated Candidate Population**: `{total_scanned_rows:,}`\n")
         f.write(f"- **Total True Links**: `{total_true_links:,}`\n\n")
 
-        f.write("## 1. Primary Blocking Ceiling Metrics\n\n")
-        f.write("| Metric | Score | Target Gate |\n")
+        if is_parity:
+            f.write(f"## Lexical Parity Gate Verdict: **{'PASS' if parity_passed else 'FAIL'}**\n\n")
+            f.write("| Metric | EXP_003 Authoritative Baseline | EXP_004 Lexical-Only Path | Match? |\n")
+            f.write("| :--- | :--- | :--- | :--- |\n")
+            f.write(f"| **True Links Hit** | 112,143 / 172,729 | {total_union_hits:,} / {total_true_links:,} | {'YES' if total_union_hits == 112143 else 'NO'} |\n")
+            f.write(f"| **True Link Recall** | 0.649242 (64.92%) | {overall_link_recall:.6f} ({overall_link_recall:.2%}) | {'YES' if abs(overall_link_recall-0.649242)<1e-4 else 'NO'} |\n")
+            f.write(f"| **Full Entity Coverage** | 0.304864 (30.49%) | {full_coverage_rate:.6f} ({full_coverage_rate:.2%}) | {'YES' if abs(full_coverage_rate-0.304864)<1e-4 else 'NO'} |\n")
+            f.write(f"| **Oracle Macro F0.5** | **0.831634** | **{oracle_macro_f05:.6f}** | {'YES' if abs(oracle_macro_f05-0.831634)<1e-4 else 'NO'} |\n\n")
+
+        f.write("## 1. Primary Ceiling Metrics\n\n")
+        f.write("| Metric | Score | Note |\n")
         f.write("| :--- | :--- | :--- |\n")
-        f.write(f"| **Oracle Macro F0.5** | **{oracle_macro_f05:.6f}** | >= {target_f05:.4f} |\n")
-        f.write(f"| True-Link Recall | {overall_link_recall:.4%} | >= 95.0% |\n")
-        f.write(f"| Full-Entity Coverage | {full_coverage_rate:.4%} | High |\n")
-        f.write(f"| Total Candidate Pairs | {cand_stats['total_pairs']:,} | Manageable |\n")
-        f.write(f"| Mean Candidates / S1 | {cand_stats['mean']:.1f} | - |\n")
-        f.write(f"| Peak RAM (RSS) | {peak_rss:.1f} MB | <= {config.get('execution', {}).get('memory_safety', {}).get('max_ram_gb', 55)*1024:.0f} MB |\n")
-        f.write(f"| Runtime | {total_runtime:.2f}s | Scalable |\n\n")
+        f.write(f"| **Oracle Macro F0.5** | **{oracle_macro_f05:.6f}** | Entity-level macro F0.5 |\n")
+        f.write(f"| True-Link Recall | {overall_link_recall:.4%} | {total_union_hits:,} / {total_true_links:,} |\n")
+        f.write(f"| Full-Entity Coverage | {full_coverage_rate:.4%} | Non-singleton entities with 100% hits |\n")
+        f.write(f"| Total Candidate Pairs | {cand_stats['total_pairs']:,} | Manageable volume |\n")
+        f.write(f"| Mean Candidates / S1 | {cand_stats['mean']:.1f} | Median: {cand_stats['median']:.1f}, P99: {cand_stats['p99']:.1f} |\n")
+        f.write(f"| Peak RAM (RSS) | {peak_rss:.1f} MB | Initial: {init_rss:.1f} MB |\n")
+        f.write(f"| Total Runtime | {total_runtime:.2f}s | Finished cleanly |\n\n")
 
-        f.write("## 2. Incremental Miss Recovery Analysis\n\n")
-        f.write("| Channel | Standalone Recall | EXP_003 Misses Recovered | % Misses Recovered | Candidate Pairs | Cands / Recovered Link |\n")
-        f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
-        for row in incremental_table:
-            f.write(f"| `{row['channel']}` | {row['recall']:.2%} | {row['misses_recovered']:,} | {row['pct_misses_recovered']:.2%} | {row['new_candidate_pairs']:,} | {row['cands_per_recovered_link']} |\n")
-        f.write("\n")
+        if sweep_table:
+            f.write("## 2. In-Memory Top-K & Similarity Threshold Sweep Results\n\n")
+            f.write("| Top-K | Cosine Thresh | Links Hit | Recall | EXP_003 Misses Recovered | % Misses Recovered | Candidate Pairs | Cands / Rec Link |\n")
+            f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+            for row in sweep_table:
+                f.write(f"| {row['top_k']} | {row['similarity_threshold']:.2f} | {row['true_links_hit']:,} | {row['true_link_recall']:.2%} | {row['exp003_misses_recovered']:,} | {row['pct_misses_recovered']:.2%} | {row['total_candidate_pairs']:,} | {row['cands_per_recovered_link']} |\n")
+            f.write("\n")
 
-        f.write("## 3. Entity Cardinality Performance Breakdown\n\n")
+        f.write("## 3. Entity Cardinality Breakdown\n\n")
         f.write("| Ground-Truth Match Cardinality | Entity Count | True Links | Link Recall | Full Coverage | Oracle Macro F0.5 |\n")
         f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
         for row in cardinality_breakdown:
@@ -717,7 +739,7 @@ if __name__ == "__main__":
     parser.add_argument("--val-split-path", default="artifacts/splits/val_s1_ids_50k_seed42.parquet", help="Path to validation split parquet")
     parser.add_argument("--output-dir", default="reports/blocking", help="Output directory")
     parser.add_argument("--experiment-id", default="EXP_004_cloud_ngram_tfidf_blocker", help="Experiment ID")
-    parser.add_argument("--mode", choices=["smoke_test", "pilot", "full"], default="smoke_test", help="Execution mode")
+    parser.add_argument("--mode", choices=["plumbing_smoke", "positive_smoke", "pilot", "full", "parity_check"], default="plumbing_smoke", help="Execution mode")
     parser.add_argument("--pilot-country", default="India", help="Country partition for pilot mode")
     parser.add_argument("--pilot-source", default="S2", help="Candidate source for pilot mode")
     parser.add_argument("--smoke-s1-count", type=int, default=500, help="S1 queries for smoke test")

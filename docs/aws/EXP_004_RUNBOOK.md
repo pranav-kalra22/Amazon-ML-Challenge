@@ -11,7 +11,8 @@
 
 | Parameter | Specification | Rationale |
 | :--- | :--- | :--- |
-| **Instance Type** | `ml.m5.4xlarge` or `m6i.4xlarge` | 16 vCPUs, 64 GiB RAM provides comfortable headroom for fitting character TF-IDF and multi-threaded sparse top-N multiplication. |
+| **Instance Type** | `ml.m5.4xlarge` or `ml.m6i.4xlarge` | 16 vCPUs, 64 GiB RAM provides comfortable headroom for fitting character TF-IDF and multi-threaded sparse top-N multiplication. (Always use the full `ml.*` SageMaker instance identifier, never bare `m6i.4xlarge`). |
+| **Notebook Platform** | `notebook-al2023-v1` | Amazon Linux 2023 provides modern glibc, OpenSSL 3, and native Python 3.10/3.11/3.12 support. |
 | **Attached Storage** | 150 GiB gp3 EBS | Holds training raw TSVs (~1.3 GB), validation splits, vectorizer matrix caches (~5–10 GB), and candidate diagnostics. |
 | **Target Python Version**| Python 3.10, 3.11, or 3.12 | Fully supported by `sparse_dot_topn` 1.2.0 manylinux wheels. |
 | **S3 Prefix Structure** | `s3://<BUCKET>/amazon-ml-challenge/` | Clean separation between dataset, experiment outputs, and caches. |
@@ -41,30 +42,47 @@ s3://<BUCKET>/amazon-ml-challenge/
 
 ---
 
-## 2. Environment Setup in SageMaker Terminal
+## 2. Environment Setup & Private Repository Authentication
 
-Open a terminal inside your SageMaker Notebook or Studio environment:
+The project repository `pranav-kalra22/Amazon-ML-Challenge` is private. Unauthenticated `git clone` will fail with an HTTP 403 / Authentication error.
 
+> [!CAUTION]
+> **SECURITY DIRECTIVE:**
+> NEVER commit a Personal Access Token (PAT), AWS key, or secret into this repository.
+> NEVER hard-code credentials into scripts, command histories, or markdown documentation.
+
+### Safe Authentication Options
+
+#### Option A: SageMaker Git Integration via AWS Secrets Manager (Recommended)
+1. In the AWS Console, store your GitHub PAT in AWS Secrets Manager under secret name `github/pranav-kalra22/token`.
+2. In SageMaker Console -> **Notebook instances** -> **Git repositories**, add `https://github.com/pranav-kalra22/Amazon-ML-Challenge.git` and associate the Secrets Manager secret.
+3. Attach this repository when creating the Notebook Instance (`notebook-al2023-v1`). SageMaker automatically clones the repository into `/home/ec2-user/SageMaker/` on launch.
+
+#### Option B: Interactive Runtime Authentication (CLI Terminal)
+If cloning manually in the SageMaker terminal:
 ```bash
-# 1. Update git and navigate to SageMaker home
 cd /home/ec2-user/SageMaker
 
-# 2. Clone repository
+# Clone using HTTPS — Git will prompt interactively for Username and Personal Access Token (PAT)
+# NEVER put the PAT into the URL string or bash command history!
 git clone https://github.com/pranav-kalra22/Amazon-ML-Challenge.git
 cd Amazon-ML-Challenge
 
-# 3. Checkout active development branch
+# Checkout active development branch
 git checkout phase2/blocking-baseline
 git status
+```
 
-# 4. Activate or create Python 3.12 / 3.10 virtual environment
+### Environment Initialization
+```bash
+# 1. Activate or create Python 3.12 / 3.10 virtual environment
 conda create -n amz_er python=3.12 -y
 conda activate amz_er
 
-# 5. Install audited cloud dependencies
+# 2. Install audited cloud dependencies
 pip install -r requirements-cloud.txt
 
-# 6. Verify automated test suite passes before running
+# 3. Verify automated test suite passes before running
 pytest -v
 ```
 
