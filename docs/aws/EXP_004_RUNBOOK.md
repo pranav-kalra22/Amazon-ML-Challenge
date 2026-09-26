@@ -68,8 +68,8 @@ cd /home/ec2-user/SageMaker
 git clone https://github.com/pranav-kalra22/Amazon-ML-Challenge.git
 cd Amazon-ML-Challenge
 
-# Checkout active development branch
-git checkout phase2/blocking-baseline
+# Checkout audited AWS baseline commit / tag
+git checkout exp004-aws-baseline
 git status
 ```
 
