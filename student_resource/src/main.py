@@ -41,6 +41,7 @@ from src.features import (
 from src.model import EntityMatchModel
 from src.evaluation import evaluate_predictions, error_analysis
 from src.inference import run_inference
+from src.embeddings import EmbeddingEngine
 
 
 def build_ground_truth_dict(gt: pd.DataFrame) -> dict:
@@ -98,6 +99,8 @@ def run_training_pipeline(
     train_only: bool = False,
     use_tfidf_blocking: bool = True,
     tfidf_top_k: int = 20,
+    use_embeddings: bool = True,
+    embedding_model: str = "all-MiniLM-L6-v2",
 ):
     """Run the full training + validation pipeline."""
     start = time.time()
@@ -119,6 +122,14 @@ def run_training_pipeline(
     print("  Normalizing Source 3...")
     s3 = normalize_dataframe(s3)
     print("  Done.")
+
+    # ── Initialize Embedding Engine ──────────────────────────────────────
+    embedding_engine = None
+    if use_embeddings:
+        print("\n  Initializing Embedding Engine...")
+        embedding_engine = EmbeddingEngine(model_name=embedding_model)
+        all_entities = pd.concat([s1, s2, s3], ignore_index=True)
+        embedding_engine.encode_entities(all_entities, text_column="name_norm")
 
     # Build ground truth dict
     gt_dict = build_ground_truth_dict(gt)
@@ -149,6 +160,7 @@ def run_training_pipeline(
         s1_train, s2, s3,
         use_tfidf=use_tfidf_blocking,
         tfidf_top_k=tfidf_top_k,
+        embedding_engine=embedding_engine,
     )
     print("\n  Measuring blocking recall on training set:")
     gt_train_df = gt[gt["source1_entity_id"].isin(train_ids)]
@@ -160,6 +172,7 @@ def run_training_pipeline(
         s1_val, s2, s3,
         use_tfidf=use_tfidf_blocking,
         tfidf_top_k=tfidf_top_k,
+        embedding_engine=embedding_engine,
     )
     print("\n  Measuring blocking recall on validation set:")
     gt_val_df = gt[gt["source1_entity_id"].isin(val_ids)]
@@ -184,7 +197,8 @@ def run_training_pipeline(
     # Build training feature matrix
     print("\n--- Training features ---")
     train_features = build_feature_matrix(
-        train_candidates, s1_lookup, other_lookup, tfidf_engine
+        train_candidates, s1_lookup, other_lookup, tfidf_engine,
+        embedding_engine=embedding_engine,
     )
     train_labels = build_training_labels(train_features, gt_train_dict)
     train_features["label"] = train_labels
@@ -195,7 +209,8 @@ def run_training_pipeline(
     # Build validation feature matrix
     print("\n--- Validation features ---")
     val_features = build_feature_matrix(
-        val_candidates, s1_lookup, other_lookup, tfidf_engine
+        val_candidates, s1_lookup, other_lookup, tfidf_engine,
+        embedding_engine=embedding_engine,
     )
     val_labels = build_training_labels(val_features, gt_val_dict)
     val_features["label"] = val_labels
@@ -265,7 +280,7 @@ def run_training_pipeline(
     elapsed = time.time() - start
     print(f"\n  Training pipeline completed in {elapsed/60:.1f} minutes")
 
-    return model, tfidf_engine, s1, s2, s3
+    return model, tfidf_engine, embedding_engine, s1, s2, s3
 
 
 def run_test_pipeline(
@@ -274,11 +289,14 @@ def run_test_pipeline(
     model_path: str = "models/model.joblib",
     model=None,
     tfidf_engine=None,
+    embedding_engine=None,
     train_s1=None,
     train_s2=None,
     train_s3=None,
     use_tfidf_blocking: bool = True,
     tfidf_top_k: int = 20,
+    use_embeddings: bool = True,
+    embedding_model: str = "all-MiniLM-L6-v2",
 ):
     """Run inference on test data and generate output files."""
     start = time.time()
@@ -306,11 +324,19 @@ def run_test_pipeline(
         all_test = pd.concat([s1_test, s2_test, s3_test], ignore_index=True)
         tfidf_engine.fit(all_test)
 
+    # ── Initialize embedding engine for test if not provided ─────────────
+    if embedding_engine is None and use_embeddings:
+        print("\n  Initializing Embedding Engine for test data...")
+        embedding_engine = EmbeddingEngine(model_name=embedding_model)
+        all_test_entities = pd.concat([s1_test, s2_test, s3_test], ignore_index=True)
+        embedding_engine.encode_entities(all_test_entities, text_column="name_norm")
+
     # ── Generate candidates ──────────────────────────────────────────────
     test_candidates = generate_candidates(
         s1_test, s2_test, s3_test,
         use_tfidf=use_tfidf_blocking,
         tfidf_top_k=tfidf_top_k,
+        embedding_engine=embedding_engine,
     )
 
     # Build lookups
@@ -328,6 +354,7 @@ def run_test_pipeline(
         s1_lookup=s1_lookup,
         other_lookup=other_lookup,
         tfidf_engine=tfidf_engine,
+        embedding_engine=embedding_engine,
         output_dir=output_dir,
     )
 
@@ -382,6 +409,11 @@ def main():
         default=20,
         help="Number of top TF-IDF candidates per entity (default: 20)",
     )
+    parser.add_argument(
+        "--no-embeddings",
+        action="store_true",
+        help="Disable sentence-transformer embeddings (faster, lower accuracy)",
+    )
     args = parser.parse_args()
 
     use_tfidf = not args.no_tfidf_blocking
@@ -389,10 +421,13 @@ def main():
     print("=" * 60)
     print("Business Entity Resolution Pipeline")
     print("=" * 60)
+    use_emb = not args.no_embeddings
+
     print(f"  Data dir:    {args.data_dir}")
     print(f"  Output dir:  {args.output_dir}")
     print(f"  Model dir:   {args.model_dir}")
     print(f"  TF-IDF blocking: {'ON' if use_tfidf else 'OFF'}")
+    print(f"  Embeddings:  {'ON' if use_emb else 'OFF'}")
     print(f"  TF-IDF top-K: {args.tfidf_top_k}")
 
     if args.test_only:
@@ -401,17 +436,19 @@ def main():
             output_dir=args.output_dir,
             model_path=args.model_path,
             use_tfidf_blocking=use_tfidf,
+            use_embeddings=use_emb,
             tfidf_top_k=args.tfidf_top_k,
         )
     else:
         # Training pipeline
-        model, tfidf_engine, s1, s2, s3 = run_training_pipeline(
+        model, tfidf_engine, embedding_engine, s1, s2, s3 = run_training_pipeline(
             data_dir=args.data_dir,
             output_dir=args.output_dir,
             model_dir=args.model_dir,
             train_only=args.train_only,
             use_tfidf_blocking=use_tfidf,
             tfidf_top_k=args.tfidf_top_k,
+            use_embeddings=use_emb,
         )
 
         if not args.train_only:
@@ -421,8 +458,10 @@ def main():
                 output_dir=args.output_dir,
                 model=model,
                 tfidf_engine=None,  # Refit on test data
+                embedding_engine=None,  # Refit on test data
                 use_tfidf_blocking=use_tfidf,
                 tfidf_top_k=args.tfidf_top_k,
+                use_embeddings=use_emb,
             )
 
     print("\n" + "=" * 60)

@@ -6,3 +6,5 @@ python-Levenshtein>=0.20.0
 rapidfuzz>=3.0.0
 tqdm>=4.64.0
 joblib>=1.2.0
+sentence-transformers>=2.2.0
+torch>=2.0.0

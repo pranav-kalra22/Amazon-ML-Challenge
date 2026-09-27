@@ -25,6 +25,7 @@ def run_inference(
     s1_lookup: dict,
     other_lookup: dict,
     tfidf_engine=None,
+    embedding_engine=None,
     threshold: float = None,
     output_dir: str = "output",
     verbose: bool = True,
@@ -56,7 +57,8 @@ def run_inference(
 
     # ── Build features for all candidate pairs ────────────────────────────
     feature_df = build_feature_matrix(
-        candidates, s1_lookup, other_lookup, tfidf_engine, verbose=verbose
+        candidates, s1_lookup, other_lookup, tfidf_engine,
+        embedding_engine=embedding_engine, verbose=verbose
     )
 
     # ── Predict match probabilities ──────────────────────────────────────

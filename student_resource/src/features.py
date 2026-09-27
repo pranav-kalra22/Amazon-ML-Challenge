@@ -144,6 +144,7 @@ def compute_pair_features(
     row1: dict,
     row2: dict,
     tfidf_engine: TfidfSimilarityEngine = None,
+    embedding_engine=None,
 ) -> dict:
     """Compute all similarity features for a single candidate pair.
 
@@ -245,6 +246,14 @@ def compute_pair_features(
         features["name_tfidf_cosine"] = 0.0
         features["addr_tfidf_cosine"] = 0.0
 
+    # ── Embedding features (if engine provided) ────────────────────────────
+    if embedding_engine is not None:
+        eid1 = row1.get("entity_id", "")
+        eid2 = row2.get("entity_id", "")
+        features["name_embedding_cosine"] = embedding_engine.cosine_similarity(eid1, eid2)
+    else:
+        features["name_embedding_cosine"] = 0.0
+
     # ── Combined / interaction features ────────────────────────────────────
     features["name_addr_avg_jw"] = (
         features["name_jaro_winkler"] + features["addr_jaro_winkler"]
@@ -256,6 +265,12 @@ def compute_pair_features(
         features["name_jaro_winkler"], features["addr_jaro_winkler"]
     )
 
+    # ── Embedding interaction features ─────────────────────────────────────
+    features["emb_x_country"] = features["name_embedding_cosine"] * features["country_match"]
+    features["emb_x_addr_jw"] = features["name_embedding_cosine"] * features["addr_jaro_winkler"]
+    features["emb_x_name_jw"] = features["name_embedding_cosine"] * features["name_jaro_winkler"]
+    features["emb_minus_name_tfidf"] = features["name_embedding_cosine"] - features["name_tfidf_cosine"]
+
     return features
 
 
@@ -264,6 +279,7 @@ def build_feature_matrix(
     s1_lookup: dict,
     other_lookup: dict,
     tfidf_engine: TfidfSimilarityEngine = None,
+    embedding_engine=None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Build a feature matrix for all candidate pairs.
@@ -298,7 +314,7 @@ def build_feature_matrix(
         if row1 is None or row2 is None:
             continue
 
-        feats = compute_pair_features(row1, row2, tfidf_engine)
+        feats = compute_pair_features(row1, row2, tfidf_engine, embedding_engine)
         feats["s1_id"] = s1_eid
         feats["s2s3_id"] = cand_eid
         rows.append(feats)

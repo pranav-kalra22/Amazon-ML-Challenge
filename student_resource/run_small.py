@@ -32,6 +32,7 @@ from src.features import (
 from src.model import EntityMatchModel
 from src.evaluation import evaluate_predictions, error_analysis
 from src.inference import run_inference
+from src.embeddings import EmbeddingEngine
 
 
 def sample_data(data_dir: str, n_s1: int = 500, seed: int = 42):
@@ -205,12 +206,17 @@ def main():
         help="Disable TF-IDF blocking (faster)",
     )
     parser.add_argument(
+        "--no-embeddings", action="store_true",
+        help="Disable sentence-transformer embeddings (faster, lower accuracy)",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed (default: 42)",
     )
     args = parser.parse_args()
 
     use_tfidf = not args.no_tfidf_blocking
+    use_emb = not args.no_embeddings
     start_time = time.time()
 
     print("=" * 60)
@@ -232,6 +238,14 @@ def main():
     s2 = normalize_dataframe(s2)
     s3 = normalize_dataframe(s3)
     print("  Done.")
+
+    # ── Step 2b: Initialize Embedding Engine ─────────────────────────────
+    embedding_engine = None
+    if use_emb:
+        print("\n  Initializing Embedding Engine...")
+        embedding_engine = EmbeddingEngine(model_name="all-MiniLM-L6-v2")
+        all_entities = pd.concat([s1, s2, s3], ignore_index=True)
+        embedding_engine.encode_entities(all_entities, text_column="name_norm")
 
     # ── Step 3: Train/Val Split (entity-level) ───────────────────────────
     gt_dict = build_ground_truth_dict(gt)
@@ -260,14 +274,16 @@ def main():
 
     print("\n--- Training candidates ---")
     train_candidates = generate_candidates(
-        s1_train, s2, s3, use_tfidf=use_tfidf, tfidf_top_k=15
+        s1_train, s2, s3, use_tfidf=use_tfidf, tfidf_top_k=15,
+        embedding_engine=embedding_engine,
     )
     gt_train_df = gt[gt["source1_entity_id"].isin(train_ids)]
     measure_blocking_recall(train_candidates, gt_train_df)
 
     print("\n--- Validation candidates ---")
     val_candidates = generate_candidates(
-        s1_val, s2, s3, use_tfidf=use_tfidf, tfidf_top_k=15
+        s1_val, s2, s3, use_tfidf=use_tfidf, tfidf_top_k=15,
+        embedding_engine=embedding_engine,
     )
     gt_val_df = gt[gt["source1_entity_id"].isin(val_ids)]
     measure_blocking_recall(val_candidates, gt_val_df)
@@ -287,7 +303,8 @@ def main():
 
     print("\n--- Training features ---")
     train_features = build_feature_matrix(
-        train_candidates, s1_lookup, other_lookup, tfidf_engine
+        train_candidates, s1_lookup, other_lookup, tfidf_engine,
+        embedding_engine=embedding_engine,
     )
     train_labels = build_training_labels(train_features, gt_train_dict)
     train_features["label"] = train_labels
@@ -295,7 +312,8 @@ def main():
 
     print("\n--- Validation features ---")
     val_features = build_feature_matrix(
-        val_candidates, s1_lookup, other_lookup, tfidf_engine
+        val_candidates, s1_lookup, other_lookup, tfidf_engine,
+        embedding_engine=embedding_engine,
     )
     val_labels = build_training_labels(val_features, gt_val_dict)
     val_features["label"] = val_labels
@@ -372,7 +390,8 @@ def main():
         # Use the full sampled S1 as "test" data to generate output
         os.makedirs(args.output_dir, exist_ok=True)
         all_candidates = generate_candidates(
-            s1, s2, s3, use_tfidf=use_tfidf, tfidf_top_k=15, verbose=False
+            s1, s2, s3, use_tfidf=use_tfidf, tfidf_top_k=15,
+            embedding_engine=embedding_engine, verbose=False
         )
 
         match_dict = run_inference(
@@ -384,6 +403,7 @@ def main():
             s1_lookup=s1_lookup,
             other_lookup=other_lookup,
             tfidf_engine=tfidf_engine,
+            embedding_engine=embedding_engine,
             output_dir=args.output_dir,
         )
 

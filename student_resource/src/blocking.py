@@ -248,6 +248,9 @@ def generate_candidates(
     s3: pd.DataFrame,
     use_tfidf: bool = True,
     tfidf_top_k: int = 20,
+    embedding_engine=None,
+    embedding_top_k: int = 30,
+    embedding_min_score: float = 0.3,
     verbose: bool = True,
 ) -> dict:
     """Run full multi-strategy blocking pipeline.
@@ -260,13 +263,15 @@ def generate_candidates(
 
     all_candidates = defaultdict(set)
 
+    n_strategies = 4 + (1 if embedding_engine is not None else 0)
+
     for label, s_other in [("S2", s2), ("S3", s3)]:
         if verbose:
             print(f"\n--- Blocking S1 vs {label} ---")
 
         # Strategy 1: Name token blocking
         if verbose:
-            print("  [1/4] Name token blocking...")
+            print(f"  [1/{n_strategies}] Name token blocking...")
         name_cands = name_token_block(s1, s_other, min_shared_tokens=1)
         if verbose:
             n_pairs = sum(len(v) for v in name_cands.values())
@@ -274,7 +279,7 @@ def generate_candidates(
 
         # Strategy 2: Character n-gram blocking
         if verbose:
-            print("  [2/4] Character n-gram blocking...")
+            print(f"  [2/{n_strategies}] Character n-gram blocking...")
         ngram_cands = ngram_block(s1, s_other, n=3, min_shared=2)
         if verbose:
             n_pairs = sum(len(v) for v in ngram_cands.values())
@@ -284,7 +289,7 @@ def generate_candidates(
         tfidf_cands = {}
         if use_tfidf:
             if verbose:
-                print("  [3/4] TF-IDF blocking...")
+                print(f"  [3/{n_strategies}] TF-IDF blocking...")
             tfidf_cands = tfidf_block(s1, s_other, top_k=tfidf_top_k, min_score=0.15)
             if verbose:
                 n_pairs = sum(len(v) for v in tfidf_cands.values())
@@ -292,14 +297,29 @@ def generate_candidates(
 
         # Strategy 4: Numeric token blocking
         if verbose:
-            print("  [4/4] Numeric token blocking...")
+            step_num = 4 if use_tfidf else 3
+            print(f"  [{step_num}/{n_strategies}] Numeric token blocking...")
         num_cands = numeric_token_block(s1, s_other, min_shared=1)
         if verbose:
             n_pairs = sum(len(v) for v in num_cands.values())
             print(f"        → {len(num_cands):,} S1 entities, {n_pairs:,} pairs")
 
-        # Union
-        merged = union_candidates(name_cands, ngram_cands, tfidf_cands, num_cands)
+        # Strategy 5: Embedding-based semantic blocking (if engine provided)
+        emb_cands = {}
+        if embedding_engine is not None:
+            if verbose:
+                print(f"  [{n_strategies}/{n_strategies}] Embedding semantic blocking...")
+            from src.embeddings import embedding_block
+            emb_cands = embedding_block(
+                s1, s_other, embedding_engine,
+                top_k=embedding_top_k, min_score=embedding_min_score,
+            )
+            if verbose:
+                n_pairs = sum(len(v) for v in emb_cands.values())
+                print(f"        → {len(emb_cands):,} S1 entities, {n_pairs:,} pairs")
+
+        # Union all strategies
+        merged = union_candidates(name_cands, ngram_cands, tfidf_cands, num_cands, emb_cands)
         for s1_eid, cands in merged.items():
             all_candidates[s1_eid].update(cands)
 

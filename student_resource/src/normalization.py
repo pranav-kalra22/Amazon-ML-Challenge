@@ -8,6 +8,8 @@ punctuation, casing, abbreviation variants, and whitespace.
 import re
 import unicodedata
 
+import pandas as pd
+
 
 # ── Legal suffix / abbreviation mappings ──────────────────────────────────────
 LEGAL_SUFFIX_MAP = {
@@ -277,8 +279,6 @@ def extract_name_tokens(name: str) -> set:
 
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Add normalized columns to a source dataframe."""
-    import pandas as pd
-
     df = df.copy()
     df["name_norm"] = df["business_name"].apply(normalize_name)
     df["addr_norm"] = df["business_address"].apply(normalize_address)
